@@ -25,3 +25,8 @@ build/
 
 # Logs
 *.log
+
+
+# Added by cargo
+
+/target
