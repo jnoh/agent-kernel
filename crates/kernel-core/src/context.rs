@@ -336,10 +336,10 @@ impl ContextManager {
     /// Returns the number of tokens freed, or an error message.
     pub fn compact(&mut self) -> Result<usize, String> {
         // Death spiral guard: cooldown check
-        if let Some(last) = self.last_compaction_time {
-            if last.elapsed().as_secs() < self.config.compaction_cooldown_secs {
-                return Err("compaction cooldown active".into());
-            }
+        if let Some(last) = self.last_compaction_time
+            && last.elapsed().as_secs() < self.config.compaction_cooldown_secs
+        {
+            return Err("compaction cooldown active".into());
         }
 
         // Death spiral guard: failure count
@@ -402,7 +402,7 @@ impl ContextManager {
 /// Simple token estimation: ~4 chars per token.
 /// In production, this would use the provider's count_tokens.
 fn estimate_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Produce a brief summary of a turn.
