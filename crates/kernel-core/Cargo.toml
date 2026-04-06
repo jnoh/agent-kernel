@@ -1,0 +1,10 @@
+[package]
+name = "kernel-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kernel-interfaces = { path = "../kernel-interfaces" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
