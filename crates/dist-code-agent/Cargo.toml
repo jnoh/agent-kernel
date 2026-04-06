@@ -13,6 +13,7 @@ kernel-core = { path = "../kernel-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 [dev-dependencies]
 tempfile = "3"

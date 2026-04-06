@@ -6,6 +6,7 @@ use kernel_core::context::ContextConfig;
 use kernel_core::permission::load_policy_from_file;
 use kernel_core::session::{SessionConfig, SessionManager};
 
+use kernel_interfaces::provider::ProviderInterface;
 use kernel_interfaces::types::{CompletionConfig, ResourceBudget, SessionMode};
 
 use std::env;
@@ -33,7 +34,6 @@ fn main() {
             }
         }
     } else {
-        // Try to find a default policy file
         let default_paths = [
             workspace.join("policies/permissive.yaml"),
             workspace.join("policy.yaml"),
@@ -42,7 +42,6 @@ fn main() {
             .iter()
             .find_map(|p| load_policy_from_file(p).ok())
             .unwrap_or_else(|| {
-                // Fallback: inline permissive policy
                 kernel_interfaces::policy::Policy {
                     version: 1,
                     name: "default-permissive".into(),
@@ -67,10 +66,24 @@ fn main() {
             })
     };
 
-    let resource_budget = policy
-        .resource_budgets
-        .clone()
-        .unwrap_or_default();
+    let resource_budget = policy.resource_budgets.clone().unwrap_or_default();
+
+    // Select provider: Anthropic if API key is set, otherwise echo
+    let model = env::args()
+        .position(|a| a == "--model")
+        .and_then(|i| env::args().nth(i + 1))
+        .unwrap_or_else(|| "claude-sonnet-4-20250514".into());
+
+    let provider: Box<dyn ProviderInterface> = match env::var("ANTHROPIC_API_KEY") {
+        Ok(key) if !key.is_empty() => {
+            eprintln!("Provider: anthropic ({model})");
+            Box::new(provider::AnthropicProvider::new(key, model))
+        }
+        _ => {
+            eprintln!("Provider: echo (set ANTHROPIC_API_KEY for Claude)");
+            Box::new(provider::EchoProvider)
+        }
+    };
 
     // Create session
     let mut mgr = SessionManager::new(ResourceBudget::default());
@@ -103,7 +116,6 @@ fn main() {
     let session_id = mgr.spawn_interactive(session_config, tools);
     let session = mgr.get_mut(session_id).unwrap();
 
-    let provider = provider::EchoProvider;
     let fe = frontend::ReplFrontend;
 
     let stdin = io::stdin();
@@ -135,12 +147,11 @@ fn main() {
 
         // Agent loop: keep running turns until the model stops making tool calls
         loop {
-            match session.run_turn(&provider, &fe) {
+            match session.run_turn(provider.as_ref(), &fe) {
                 Ok(result) => {
                     if !result.continues {
                         break;
                     }
-                    // Model made tool calls — continue the loop
                 }
                 Err(e) => {
                     eprintln!("Turn error: {e}");

@@ -142,8 +142,23 @@ impl TurnLoop {
             }
         }
 
-        // 1. Assemble prompt
-        let prompt = context.assemble();
+        // 1. Assemble prompt with tool definitions
+        let mut prompt = context.assemble();
+
+        // Inject tool schemas so the model knows what's available.
+        // v0.1: send all tools every turn. Demand-paging (request_tool) is v0.2.
+        if prompt.tool_definitions.is_empty() && !tools.is_empty() {
+            prompt.tool_definitions = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name(),
+                        "description": t.description(),
+                        "input_schema": t.schema(),
+                    })
+                })
+                .collect();
+        }
 
         // 2. Call model
         let response = provider
