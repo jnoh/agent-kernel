@@ -89,7 +89,6 @@ pub struct ContextManager {
 
     // File content cache (evictable, re-readable from disk)
     file_cache: HashMap<PathBuf, String>,
-    stale_files: Vec<PathBuf>,
 
     // Tool registry for demand-paging
     tool_definitions_in_context: Vec<serde_json::Value>,
@@ -123,7 +122,6 @@ impl ContextManager {
             scratchpad: Scratchpad::default(),
             turns: Vec::new(),
             file_cache: HashMap::new(),
-            stale_files: Vec::new(),
             tool_definitions_in_context: Vec::new(),
             tool_names_in_context: Vec::new(),
             tokens_used: system_prompt_tokens,
@@ -235,7 +233,6 @@ impl ContextManager {
     pub fn invalidate_files(&mut self, paths: &[PathBuf]) {
         for path in paths {
             self.file_cache.remove(path);
-            self.stale_files.push(path.clone());
         }
     }
 
@@ -318,6 +315,41 @@ impl ContextManager {
             .iter()
             .flat_map(|turn| {
                 let mut msgs = vec![turn.input.clone()];
+
+                // Include tool calls and results so the model sees the full exchange
+                if !turn.tool_exchanges.is_empty() {
+                    // Assistant message with tool calls
+                    let tool_call_content: Vec<Content> = turn
+                        .tool_exchanges
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ex)| Content::ToolCall {
+                            id: format!("call_{i}"),
+                            name: ex.tool_name.clone(),
+                            input: ex.input.clone(),
+                        })
+                        .collect();
+                    msgs.push(Message {
+                        role: Role::Assistant,
+                        content: tool_call_content,
+                    });
+
+                    // Tool results
+                    let tool_result_content: Vec<Content> = turn
+                        .tool_exchanges
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ex)| Content::ToolResult {
+                            id: format!("call_{i}"),
+                            result: ex.result.clone(),
+                        })
+                        .collect();
+                    msgs.push(Message {
+                        role: Role::User,
+                        content: tool_result_content,
+                    });
+                }
+
                 if let Some(ref response) = turn.response {
                     msgs.push(response.clone());
                 }

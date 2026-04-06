@@ -41,6 +41,56 @@ impl std::fmt::Display for TurnError {
 
 impl std::error::Error for TurnError {}
 
+/// Whether a tool dispatch resulted in execution or denial.
+enum DispatchOutcome {
+    Executed,
+    Denied,
+}
+
+/// Execute a tool and record the result in context. Returns Executed on success or error
+/// (both count as dispatched — the model sees the result either way).
+fn execute_tool(
+    tool: &dyn ToolRegistration,
+    tool_name: &str,
+    input: &serde_json::Value,
+    context: &mut ContextManager,
+    frontend: &dyn FrontendInterface,
+) -> DispatchOutcome {
+    match tool.execute(input.clone()) {
+        Ok(output) => {
+            for inv in &output.invalidations {
+                context.process_invalidation(inv);
+            }
+            frontend.on_tool_result(tool_name, &output);
+            context.append_tool_exchange(tool_name.to_string(), input.clone(), output.result);
+        }
+        Err(e) => {
+            let error_result = serde_json::json!({
+                "error": "execution_failed",
+                "message": e.to_string()
+            });
+            context.append_tool_exchange(tool_name.to_string(), input.clone(), error_result);
+        }
+    }
+    DispatchOutcome::Executed
+}
+
+/// Record a denied tool call in context.
+fn deny_tool(
+    tool_name: &str,
+    input: &serde_json::Value,
+    reason: &str,
+    context: &mut ContextManager,
+    frontend: Option<&dyn FrontendInterface>,
+) -> DispatchOutcome {
+    let denied = kernel_interfaces::tool::ToolOutput::denied(reason);
+    if let Some(fe) = frontend {
+        fe.on_tool_result(tool_name, &denied);
+    }
+    context.append_tool_exchange(tool_name.to_string(), input.clone(), denied.result);
+    DispatchOutcome::Denied
+}
+
 /// The turn loop — the heartbeat. Every other subsystem exists to serve it.
 ///
 /// Single-threaded per session. Does not know what model it's talking to
@@ -122,7 +172,6 @@ impl TurnLoop {
                     message: msg.clone(),
                     recoverable: true,
                 });
-                // Feed a budget error back to the model
                 context.append_tool_exchange(
                     tool_name.clone(),
                     input.clone(),
@@ -132,9 +181,7 @@ impl TurnLoop {
             }
 
             // Find the tool
-            let tool = tools.iter().find(|t| t.name() == tool_name);
-            let Some(tool) = tool else {
-                // Tool not found — feed error back to model
+            let Some(tool) = tools.iter().find(|t| t.name() == tool_name) else {
                 context.append_tool_exchange(
                     tool_name.clone(),
                     input.clone(),
@@ -148,45 +195,10 @@ impl TurnLoop {
             // L1: Dispatch gate check
             let decision = permission.evaluate(tool.as_ref());
 
-            match decision {
-                Decision::Allow => {
-                    match tool.execute(input.clone()) {
-                        Ok(output) => {
-                            // Process invalidations
-                            for inv in &output.invalidations {
-                                context.process_invalidation(inv);
-                            }
-                            frontend.on_tool_result(tool_name, &output);
-                            context.append_tool_exchange(
-                                tool_name.clone(),
-                                input.clone(),
-                                output.result,
-                            );
-                            tool_calls_dispatched += 1;
-                        }
-                        Err(e) => {
-                            let error_result = serde_json::json!({
-                                "error": "execution_failed",
-                                "message": e.to_string()
-                            });
-                            context.append_tool_exchange(
-                                tool_name.clone(),
-                                input.clone(),
-                                error_result,
-                            );
-                            tool_calls_dispatched += 1;
-                        }
-                    }
-                }
+            let outcome = match decision {
+                Decision::Allow => execute_tool(tool.as_ref(), tool_name, input, context, frontend),
                 Decision::Deny(reason) => {
-                    let denied = kernel_interfaces::tool::ToolOutput::denied(&reason);
-                    frontend.on_tool_result(tool_name, &denied);
-                    context.append_tool_exchange(
-                        tool_name.clone(),
-                        input.clone(),
-                        denied.result,
-                    );
-                    tool_calls_denied += 1;
+                    deny_tool(tool_name, input, &reason, context, Some(frontend))
                 }
                 Decision::Ask => {
                     let request = kernel_interfaces::frontend::PermissionRequest {
@@ -198,59 +210,23 @@ impl TurnLoop {
                             .collect(),
                         input_summary: input.to_string(),
                     };
-                    let user_decision = frontend.on_permission_request(&request);
-
-                    match user_decision {
+                    match frontend.on_permission_request(&request) {
                         Decision::Allow => {
-                            match tool.execute(input.clone()) {
-                                Ok(output) => {
-                                    for inv in &output.invalidations {
-                                        context.process_invalidation(inv);
-                                    }
-                                    frontend.on_tool_result(tool_name, &output);
-                                    context.append_tool_exchange(
-                                        tool_name.clone(),
-                                        input.clone(),
-                                        output.result,
-                                    );
-                                    tool_calls_dispatched += 1;
-                                }
-                                Err(e) => {
-                                    let error_result = serde_json::json!({
-                                        "error": "execution_failed",
-                                        "message": e.to_string()
-                                    });
-                                    context.append_tool_exchange(
-                                        tool_name.clone(),
-                                        input.clone(),
-                                        error_result,
-                                    );
-                                    tool_calls_dispatched += 1;
-                                }
-                            }
+                            execute_tool(tool.as_ref(), tool_name, input, context, frontend)
                         }
                         Decision::Deny(reason) => {
-                            let denied = kernel_interfaces::tool::ToolOutput::denied(&reason);
-                            context.append_tool_exchange(
-                                tool_name.clone(),
-                                input.clone(),
-                                denied.result,
-                            );
-                            tool_calls_denied += 1;
+                            deny_tool(tool_name, input, &reason, context, None)
                         }
                         Decision::Ask => {
-                            // User didn't decide — treat as deny
-                            let denied =
-                                kernel_interfaces::tool::ToolOutput::denied("user did not decide");
-                            context.append_tool_exchange(
-                                tool_name.clone(),
-                                input.clone(),
-                                denied.result,
-                            );
-                            tool_calls_denied += 1;
+                            deny_tool(tool_name, input, "user did not decide", context, None)
                         }
                     }
                 }
+            };
+
+            match outcome {
+                DispatchOutcome::Executed => tool_calls_dispatched += 1,
+                DispatchOutcome::Denied => tool_calls_denied += 1,
             }
         }
 
@@ -293,125 +269,12 @@ fn parse_response(
 mod tests {
     use super::*;
     use crate::context::ContextConfig;
-    use kernel_interfaces::frontend::*;
+    use crate::testutil::*;
     use kernel_interfaces::policy::{Policy, PolicyAction, PolicyRule};
     use kernel_interfaces::provider::*;
-    use kernel_interfaces::tool::*;
-    use kernel_interfaces::types::*;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    // --- Test doubles ---
-
-    /// A provider that returns a fixed response.
-    struct FakeProvider {
-        response: Response,
-    }
-
-    impl ProviderInterface for FakeProvider {
-        fn complete(&self, _prompt: &Prompt, _config: &CompletionConfig) -> Result<Response, ProviderError> {
-            Ok(self.response.clone())
-        }
-        fn count_tokens(&self, _content: &Content) -> usize { 10 }
-        fn capabilities(&self) -> ProviderCaps { ProviderCaps::default() }
-    }
-
-    /// A tool that records whether it was called and returns a fixed value.
-    struct FakeTool {
-        name: String,
-        caps: CapabilitySet,
-        relevance: RelevanceSignal,
-        called: AtomicBool,
-        return_value: serde_json::Value,
-    }
-
-    impl FakeTool {
-        fn new(name: &str, caps: &[&str], return_value: serde_json::Value) -> Self {
-            Self {
-                name: name.into(),
-                caps: caps.iter().map(|c| Capability::new(*c)).collect(),
-                relevance: RelevanceSignal { keywords: Vec::new(), tags: Vec::new() },
-                called: AtomicBool::new(false),
-                return_value,
-            }
-        }
-
-        #[allow(dead_code)]
-        fn was_called(&self) -> bool {
-            self.called.load(Ordering::Relaxed)
-        }
-    }
-
-    impl ToolRegistration for FakeTool {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { "test tool" }
-        fn capabilities(&self) -> &CapabilitySet { &self.caps }
-        fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-        fn cost(&self) -> TokenEstimate { TokenEstimate(10) }
-        fn relevance(&self) -> &RelevanceSignal { &self.relevance }
-        fn execute(&self, _input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-            self.called.store(true, Ordering::Relaxed);
-            Ok(ToolOutput::readonly(self.return_value.clone()))
-        }
-    }
-
-    /// A frontend that auto-allows permission requests and tracks calls.
-    struct FakeFrontend {
-        permission_response: Decision,
-        turns_started: AtomicU64,
-        turns_ended: AtomicU64,
-    }
-
-    impl FakeFrontend {
-        fn auto_allow() -> Self {
-            Self {
-                permission_response: Decision::Allow,
-                turns_started: AtomicU64::new(0),
-                turns_ended: AtomicU64::new(0),
-            }
-        }
-
-        fn auto_deny() -> Self {
-            Self {
-                permission_response: Decision::Deny("user denied".into()),
-                turns_started: AtomicU64::new(0),
-                turns_ended: AtomicU64::new(0),
-            }
-        }
-    }
-
-    impl FrontendInterface for FakeFrontend {
-        fn on_turn_start(&self, _turn_id: TurnId) {
-            self.turns_started.fetch_add(1, Ordering::Relaxed);
-        }
-        fn on_stream_chunk(&self, _chunk: &StreamChunk) {}
-        fn on_tool_call(&self, _name: &str, _input: &serde_json::Value) {}
-        fn on_tool_result(&self, _name: &str, _result: &ToolOutput) {}
-        fn on_permission_request(&self, _request: &PermissionRequest) -> Decision {
-            self.permission_response.clone()
-        }
-        fn on_turn_end(&self, _turn_id: TurnId) {
-            self.turns_ended.fetch_add(1, Ordering::Relaxed);
-        }
-        fn on_compaction(&self, _summary: &CompactionSummary) {}
-        fn on_workspace_changed(&self, _new_root: &Path) {}
-        fn on_error(&self, _error: &KernelError) {}
-    }
-
-    fn allow_all_policy() -> Policy {
-        Policy {
-            version: 1,
-            name: "allow-all".into(),
-            rules: vec![PolicyRule {
-                match_capabilities: vec!["fs:read".into(), "fs:write".into(), "shell:exec".into(), "net:*".into()],
-                action: PolicyAction::Allow,
-                scope_paths: Vec::new(),
-                scope_commands: Vec::new(),
-                except: Vec::new(),
-            }],
-            resource_budgets: None,
-        }
-    }
+    use kernel_interfaces::tool::ToolRegistration;
+    use kernel_interfaces::types::{CompletionConfig, TurnId};
+    use std::sync::atomic::Ordering;
 
     fn ask_all_policy() -> Policy {
         Policy {
@@ -428,26 +291,6 @@ mod tests {
         }
     }
 
-    fn text_response(text: &str) -> Response {
-        Response {
-            content: vec![Content::Text(text.into())],
-            usage: Usage { input_tokens: 100, output_tokens: 50 },
-            stop_reason: StopReason::EndTurn,
-        }
-    }
-
-    fn tool_call_response(tool_name: &str, input: serde_json::Value) -> Response {
-        Response {
-            content: vec![Content::ToolCall {
-                id: "call_1".into(),
-                name: tool_name.into(),
-                input,
-            }],
-            usage: Usage { input_tokens: 100, output_tokens: 50 },
-            stop_reason: StopReason::ToolUse,
-        }
-    }
-
     fn context_and_permission() -> (ContextManager, PermissionEvaluator) {
         let config = ContextConfig {
             context_window: 100_000,
@@ -459,14 +302,12 @@ mod tests {
         (cm, pe)
     }
 
-    // --- Tests ---
-
     #[test]
     fn text_only_response_does_not_continue() {
         let (mut cm, pe) = context_and_permission();
         cm.append_user_input("Hello".into());
         let provider = FakeProvider { response: text_response("Hi there!") };
-        let frontend = FakeFrontend::auto_allow();
+        let frontend = RecordingFrontend::auto_allow();
         let tools: Vec<Box<dyn ToolRegistration>> = Vec::new();
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
@@ -485,7 +326,7 @@ mod tests {
         let provider = FakeProvider {
             response: tool_call_response("file_read", serde_json::json!({"path": "src/main.rs"})),
         };
-        let frontend = FakeFrontend::auto_allow();
+        let frontend = RecordingFrontend::auto_allow();
         let tool = FakeTool::new("file_read", &["fs:read"], serde_json::json!("fn main() {}"));
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
@@ -521,7 +362,7 @@ mod tests {
         let provider = FakeProvider {
             response: tool_call_response("file_read", serde_json::json!({"path": "secret.env"})),
         };
-        let frontend = FakeFrontend::auto_allow();
+        let frontend = RecordingFrontend::auto_allow();
         let tool = FakeTool::new("file_read", &["fs:read"], serde_json::json!("data"));
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
@@ -546,7 +387,7 @@ mod tests {
         let provider = FakeProvider {
             response: tool_call_response("file_read", serde_json::json!({"path": "src/lib.rs"})),
         };
-        let frontend = FakeFrontend::auto_allow();
+        let frontend = RecordingFrontend::auto_allow();
         let tool = FakeTool::new("file_read", &["fs:read"], serde_json::json!("content"));
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
@@ -570,7 +411,7 @@ mod tests {
         let provider = FakeProvider {
             response: tool_call_response("shell", serde_json::json!({"command": "rm -rf /"})),
         };
-        let frontend = FakeFrontend::auto_deny();
+        let frontend = RecordingFrontend::auto_deny();
         let tool = FakeTool::new("shell", &["shell:exec"], serde_json::json!("done"));
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
@@ -588,13 +429,12 @@ mod tests {
         let provider = FakeProvider {
             response: tool_call_response("nonexistent_tool", serde_json::json!({})),
         };
-        let frontend = FakeFrontend::auto_allow();
+        let frontend = RecordingFrontend::auto_allow();
         let tools: Vec<Box<dyn ToolRegistration>> = Vec::new();
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
         let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
 
-        // Unknown tool is not dispatched and doesn't count as continue
         assert!(!result.continues);
         assert_eq!(result.tool_calls_dispatched, 0);
     }
@@ -604,7 +444,6 @@ mod tests {
         let (mut cm, pe) = context_and_permission();
         cm.append_user_input("Do everything".into());
 
-        // Response with 3 tool calls but budget of 2
         let response = Response {
             content: vec![
                 Content::ToolCall { id: "1".into(), name: "file_read".into(), input: serde_json::json!({}) },
@@ -615,10 +454,10 @@ mod tests {
             stop_reason: StopReason::ToolUse,
         };
         let provider = FakeProvider { response };
-        let frontend = FakeFrontend::auto_allow();
+        let frontend = RecordingFrontend::auto_allow();
         let tool = FakeTool::new("file_read", &["fs:read"], serde_json::json!("data"));
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
-        let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 2); // budget: 2
+        let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 2);
 
         let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
 
@@ -629,7 +468,7 @@ mod tests {
     fn turn_ids_increment() {
         let (mut cm, pe) = context_and_permission();
         let provider = FakeProvider { response: text_response("Hi") };
-        let frontend = FakeFrontend::auto_allow();
+        let frontend = RecordingFrontend::auto_allow();
         let tools: Vec<Box<dyn ToolRegistration>> = Vec::new();
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 

@@ -52,7 +52,6 @@ pub struct Session {
     pending_results: Vec<PendingResult>,
 
     // Token budget tracking (max_tokens enforced in v0.1 budget checks)
-    tokens_consumed: usize,
     #[allow(dead_code)]
     max_tokens: usize,
 }
@@ -94,17 +93,13 @@ impl Session {
         }
 
         // Run the turn
-        let result = self.turn_loop.run_turn(
+        self.turn_loop.run_turn(
             provider,
             &mut self.context,
             &self.permission,
             &self.tools,
             frontend,
-        )?;
-
-        self.tokens_consumed += self.context.tokens_used();
-
-        Ok(result)
+        )
     }
 
     /// Add user input to start a new turn.
@@ -177,7 +172,6 @@ impl SessionManager {
             turn_loop,
             tools,
             pending_results: Vec::new(),
-            tokens_consumed: 0,
             max_tokens: config.resource_budget.max_tokens_per_session,
         };
 
@@ -213,64 +207,11 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kernel_interfaces::frontend::*;
+    use crate::testutil::*;
     use kernel_interfaces::policy::{Policy, PolicyAction, PolicyRule};
     use kernel_interfaces::provider::*;
-    use kernel_interfaces::tool::*;
     use kernel_interfaces::types::*;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    // --- Test doubles (same pattern as turn_loop tests) ---
-
-    struct FakeProvider {
-        response: Response,
-    }
-
-    impl ProviderInterface for FakeProvider {
-        fn complete(&self, _: &Prompt, _: &CompletionConfig) -> Result<Response, ProviderError> {
-            Ok(self.response.clone())
-        }
-        fn count_tokens(&self, _: &Content) -> usize { 10 }
-        fn capabilities(&self) -> ProviderCaps { ProviderCaps::default() }
-    }
-
-    struct FakeFrontend {
-        turns_started: AtomicU64,
-    }
-
-    impl FakeFrontend {
-        fn new() -> Self {
-            Self { turns_started: AtomicU64::new(0) }
-        }
-    }
-
-    impl FrontendInterface for FakeFrontend {
-        fn on_turn_start(&self, _: TurnId) { self.turns_started.fetch_add(1, Ordering::Relaxed); }
-        fn on_stream_chunk(&self, _: &StreamChunk) {}
-        fn on_tool_call(&self, _: &str, _: &serde_json::Value) {}
-        fn on_tool_result(&self, _: &str, _: &ToolOutput) {}
-        fn on_permission_request(&self, _: &PermissionRequest) -> Decision { Decision::Allow }
-        fn on_turn_end(&self, _: TurnId) {}
-        fn on_compaction(&self, _: &CompactionSummary) {}
-        fn on_workspace_changed(&self, _: &Path) {}
-        fn on_error(&self, _: &KernelError) {}
-    }
-
-    fn allow_all_policy() -> Policy {
-        Policy {
-            version: 1,
-            name: "allow-all".into(),
-            rules: vec![PolicyRule {
-                match_capabilities: vec!["fs:read".into(), "fs:write".into(), "shell:exec".into()],
-                action: PolicyAction::Allow,
-                scope_paths: Vec::new(),
-                scope_commands: Vec::new(),
-                except: Vec::new(),
-            }],
-            resource_budgets: None,
-        }
-    }
+    use std::sync::atomic::Ordering;
 
     fn test_session_config() -> SessionConfig {
         SessionConfig {
@@ -315,14 +256,13 @@ mod tests {
 
         session.add_user_input("Hello".into());
 
-        let provider = FakeProvider {
-            response: Response {
+        let provider = FakeProvider { response: Response {
                 content: vec![Content::Text("Hi there!".into())],
                 usage: Usage { input_tokens: 50, output_tokens: 20 },
                 stop_reason: StopReason::EndTurn,
             },
         };
-        let frontend = FakeFrontend::new();
+        let frontend = RecordingFrontend::auto_allow();
 
         let result = session.run_turn(&provider, &frontend).unwrap();
         assert!(!result.continues);
@@ -344,14 +284,13 @@ mod tests {
 
         session.add_user_input("What happened?".into());
 
-        let provider = FakeProvider {
-            response: Response {
+        let provider = FakeProvider { response: Response {
                 content: vec![Content::Text("CI failed.".into())],
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
             },
         };
-        let frontend = FakeFrontend::new();
+        let frontend = RecordingFrontend::auto_allow();
 
         let result = session.run_turn(&provider, &frontend).unwrap();
         assert!(!result.continues);
@@ -392,46 +331,16 @@ mod tests {
         assert_eq!(session.context().turn_count(), 1);
     }
 
-    // Minimal tool for session tests
-    struct FakeToolSimple {
-        name: String,
-        caps: CapabilitySet,
-        relevance: RelevanceSignal,
-    }
-
-    impl FakeToolSimple {
-        fn new(name: &str, caps: &[&str]) -> Self {
-            Self {
-                name: name.into(),
-                caps: caps.iter().map(|c| Capability::new(*c)).collect(),
-                relevance: RelevanceSignal { keywords: Vec::new(), tags: Vec::new() },
-            }
-        }
-    }
-
-    impl ToolRegistration for FakeToolSimple {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { "test" }
-        fn capabilities(&self) -> &CapabilitySet { &self.caps }
-        fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-        fn cost(&self) -> TokenEstimate { TokenEstimate(10) }
-        fn relevance(&self) -> &RelevanceSignal { &self.relevance }
-        fn execute(&self, _: serde_json::Value) -> Result<ToolOutput, ToolError> {
-            Ok(ToolOutput::readonly(serde_json::json!("ok")))
-        }
-    }
-
     #[test]
     fn session_with_tool_dispatches_through_policy() {
         let mut mgr = SessionManager::new(ResourceBudget::default());
-        let tool = FakeToolSimple::new("file_read", &["fs:read"]);
+        let tool = FakeTool::new("file_read", &["fs:read"], serde_json::json!("ok"));
         let id = mgr.spawn_interactive(test_session_config(), vec![Box::new(tool)]);
         let session = mgr.get_mut(id).unwrap();
 
         session.add_user_input("Read main.rs".into());
 
-        let provider = FakeProvider {
-            response: Response {
+        let provider = FakeProvider { response: Response {
                 content: vec![Content::ToolCall {
                     id: "c1".into(),
                     name: "file_read".into(),
@@ -441,7 +350,7 @@ mod tests {
                 stop_reason: StopReason::ToolUse,
             },
         };
-        let frontend = FakeFrontend::new();
+        let frontend = RecordingFrontend::auto_allow();
 
         let result = session.run_turn(&provider, &frontend).unwrap();
         assert!(result.continues);

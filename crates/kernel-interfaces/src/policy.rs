@@ -46,12 +46,10 @@ impl Policy {
     /// Evaluate a single capability against this policy's rules.
     /// Rules are evaluated in order — first match wins.
     pub fn evaluate(&self, capability: &Capability) -> Decision {
-        let cap_pattern = Capability::new(&capability.0);
-
         for rule in &self.rules {
             for pattern_str in &rule.match_capabilities {
                 let pattern = Capability::new(pattern_str);
-                if cap_pattern.matches(&pattern) {
+                if capability.matches(&pattern) {
                     return match rule.action {
                         PolicyAction::Allow => Decision::Allow,
                         PolicyAction::Deny => Decision::Deny(format!(
