@@ -1,10 +1,12 @@
-use kernel_interfaces::frontend::FrontendInterface;
+use kernel_interfaces::frontend::FrontendEvents;
 use kernel_interfaces::provider::{ProviderInterface, Response, StopReason};
 use kernel_interfaces::tool::ToolRegistration;
 use kernel_interfaces::types::{CompletionConfig, Content, Decision, TurnId};
 
 use crate::context::ContextManager;
 use crate::permission::PermissionEvaluator;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The result of running a single turn.
 #[derive(Debug)]
@@ -16,6 +18,8 @@ pub struct TurnResult {
     pub tool_calls_dispatched: usize,
     /// Number of tool calls denied by policy.
     pub tool_calls_denied: usize,
+    /// Whether the turn was cancelled via the SessionControl cancel flag.
+    pub was_cancelled: bool,
 }
 
 /// Errors that can occur during a turn.
@@ -54,7 +58,7 @@ fn execute_tool(
     tool_name: &str,
     input: &serde_json::Value,
     context: &mut ContextManager,
-    frontend: &dyn FrontendInterface,
+    frontend: &dyn FrontendEvents,
 ) -> DispatchOutcome {
     match tool.execute(input.clone()) {
         Ok(output) => {
@@ -81,7 +85,7 @@ fn deny_tool(
     input: &serde_json::Value,
     reason: &str,
     context: &mut ContextManager,
-    frontend: Option<&dyn FrontendInterface>,
+    frontend: Option<&dyn FrontendEvents>,
 ) -> DispatchOutcome {
     let denied = kernel_interfaces::tool::ToolOutput::denied(reason);
     if let Some(fe) = frontend {
@@ -119,10 +123,14 @@ impl TurnLoop {
         context: &mut ContextManager,
         permission: &PermissionEvaluator,
         tools: &[Box<dyn ToolRegistration>],
-        frontend: &dyn FrontendInterface,
+        frontend: &dyn FrontendEvents,
+        cancelled: &AtomicBool,
     ) -> Result<TurnResult, TurnError> {
         let turn_id = TurnId(self.next_turn_id);
         self.next_turn_id += 1;
+
+        // Reset cancel flag at the start of each turn
+        cancelled.store(false, Ordering::Release);
 
         frontend.on_turn_start(turn_id);
 
@@ -178,8 +186,14 @@ impl TurnLoop {
         // 4. Dispatch tool calls through permission evaluator
         let mut tool_calls_dispatched = 0;
         let mut tool_calls_denied = 0;
+        let mut was_cancelled = false;
 
         for (_call_id, tool_name, input) in &tool_calls {
+            // Check cancellation between tool dispatches
+            if cancelled.load(Ordering::Acquire) {
+                was_cancelled = true;
+                break;
+            }
             if tool_calls_dispatched + tool_calls_denied >= self.max_tool_invocations_per_turn {
                 let msg = format!(
                     "max tool invocations per turn ({}) exceeded",
@@ -220,11 +234,7 @@ impl TurnLoop {
                 Decision::Ask => {
                     let request = kernel_interfaces::frontend::PermissionRequest {
                         tool_name: tool_name.clone(),
-                        capabilities: tool
-                            .capabilities()
-                            .iter()
-                            .map(|c| c.0.clone())
-                            .collect(),
+                        capabilities: tool.capabilities().iter().map(|c| c.0.clone()).collect(),
                         input_summary: input.to_string(),
                     };
                     match frontend.on_permission_request(&request) {
@@ -247,7 +257,9 @@ impl TurnLoop {
             }
         }
 
-        let continues = response.stop_reason == StopReason::ToolUse && tool_calls_dispatched > 0;
+        let continues = !was_cancelled
+            && response.stop_reason == StopReason::ToolUse
+            && tool_calls_dispatched > 0;
 
         frontend.on_turn_end(turn_id);
 
@@ -256,14 +268,13 @@ impl TurnLoop {
             continues,
             tool_calls_dispatched,
             tool_calls_denied,
+            was_cancelled,
         })
     }
 }
 
 /// Extract text and tool calls from a model response.
-fn parse_response(
-    response: &Response,
-) -> (Vec<String>, Vec<(String, String, serde_json::Value)>) {
+fn parse_response(response: &Response) -> (Vec<String>, Vec<(String, String, serde_json::Value)>) {
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
 
@@ -291,7 +302,6 @@ mod tests {
     use kernel_interfaces::provider::*;
     use kernel_interfaces::tool::ToolRegistration;
     use kernel_interfaces::types::{CompletionConfig, TurnId};
-    use std::sync::atomic::Ordering;
 
     fn ask_all_policy() -> Policy {
         Policy {
@@ -306,6 +316,10 @@ mod tests {
             }],
             resource_budgets: None,
         }
+    }
+
+    fn no_cancel() -> AtomicBool {
+        AtomicBool::new(false)
     }
 
     fn context_and_permission() -> (ContextManager, PermissionEvaluator) {
@@ -323,12 +337,16 @@ mod tests {
     fn text_only_response_does_not_continue() {
         let (mut cm, pe) = context_and_permission();
         cm.append_user_input("Hello".into());
-        let provider = FakeProvider { response: text_response("Hi there!") };
+        let provider = FakeProvider {
+            response: text_response("Hi there!"),
+        };
         let frontend = RecordingFrontend::auto_allow();
         let tools: Vec<Box<dyn ToolRegistration>> = Vec::new();
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
-        let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let result = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
 
         assert!(!result.continues);
         assert_eq!(result.tool_calls_dispatched, 0);
@@ -348,7 +366,9 @@ mod tests {
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
-        let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let result = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
 
         assert!(result.continues);
         assert_eq!(result.tool_calls_dispatched, 1);
@@ -384,7 +404,9 @@ mod tests {
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
-        let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let result = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
 
         assert!(!result.continues);
         assert_eq!(result.tool_calls_dispatched, 0);
@@ -409,7 +431,9 @@ mod tests {
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
-        let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let result = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
 
         assert!(result.continues);
         assert_eq!(result.tool_calls_dispatched, 1);
@@ -433,7 +457,9 @@ mod tests {
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
-        let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let result = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
 
         assert!(!result.continues);
         assert_eq!(result.tool_calls_denied, 1);
@@ -450,7 +476,9 @@ mod tests {
         let tools: Vec<Box<dyn ToolRegistration>> = Vec::new();
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
-        let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let result = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
 
         assert!(!result.continues);
         assert_eq!(result.tool_calls_dispatched, 0);
@@ -463,9 +491,21 @@ mod tests {
 
         let response = Response {
             content: vec![
-                Content::ToolCall { id: "1".into(), name: "file_read".into(), input: serde_json::json!({}) },
-                Content::ToolCall { id: "2".into(), name: "file_read".into(), input: serde_json::json!({}) },
-                Content::ToolCall { id: "3".into(), name: "file_read".into(), input: serde_json::json!({}) },
+                Content::ToolCall {
+                    id: "1".into(),
+                    name: "file_read".into(),
+                    input: serde_json::json!({}),
+                },
+                Content::ToolCall {
+                    id: "2".into(),
+                    name: "file_read".into(),
+                    input: serde_json::json!({}),
+                },
+                Content::ToolCall {
+                    id: "3".into(),
+                    name: "file_read".into(),
+                    input: serde_json::json!({}),
+                },
             ],
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
@@ -476,7 +516,9 @@ mod tests {
         let tools: Vec<Box<dyn ToolRegistration>> = vec![Box::new(tool)];
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 2);
 
-        let result = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let result = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
 
         assert_eq!(result.tool_calls_dispatched, 2);
     }
@@ -484,15 +526,21 @@ mod tests {
     #[test]
     fn turn_ids_increment() {
         let (mut cm, pe) = context_and_permission();
-        let provider = FakeProvider { response: text_response("Hi") };
+        let provider = FakeProvider {
+            response: text_response("Hi"),
+        };
         let frontend = RecordingFrontend::auto_allow();
         let tools: Vec<Box<dyn ToolRegistration>> = Vec::new();
         let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
 
         cm.append_user_input("Hello".into());
-        let r1 = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let r1 = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
         cm.append_user_input("Again".into());
-        let r2 = turn_loop.run_turn(&provider, &mut cm, &pe, &tools, &frontend).unwrap();
+        let r2 = turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .unwrap();
 
         assert_eq!(r1.turn_id, TurnId(0));
         assert_eq!(r2.turn_id, TurnId(1));

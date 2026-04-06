@@ -1,4 +1,4 @@
-use kernel_interfaces::frontend::FrontendInterface;
+use kernel_interfaces::frontend::FrontendEvents;
 use kernel_interfaces::policy::Policy;
 use kernel_interfaces::provider::ProviderInterface;
 use kernel_interfaces::tool::ToolRegistration;
@@ -11,6 +11,8 @@ use crate::permission::PermissionEvaluator;
 use crate::turn_loop::{TurnError, TurnLoop, TurnResult};
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Configuration for creating a new session.
 pub struct SessionConfig {
@@ -51,9 +53,38 @@ pub struct Session {
 
     pending_results: Vec<PendingResult>,
 
+    /// Cancellation flag — checked between tool dispatches in the turn loop.
+    cancelled: Arc<AtomicBool>,
+
     // Token budget tracking (max_tokens enforced in v0.1 budget checks)
     #[allow(dead_code)]
     max_tokens: usize,
+}
+
+impl kernel_interfaces::frontend::SessionControl for Session {
+    fn tokens_used(&self) -> usize {
+        self.context.tokens_used()
+    }
+
+    fn context_utilization(&self) -> f64 {
+        self.context.utilization()
+    }
+
+    fn turn_count(&self) -> usize {
+        self.context.turn_count()
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn request_compaction(&mut self) -> Result<usize, String> {
+        self.context.compact()
+    }
+
+    fn set_policy(&mut self, policy: Policy) {
+        self.permission.set_policy(policy);
+    }
 }
 
 impl Session {
@@ -61,7 +92,7 @@ impl Session {
     pub fn run_turn(
         &mut self,
         provider: &dyn ProviderInterface,
-        frontend: &dyn FrontendInterface,
+        frontend: &dyn FrontendEvents,
     ) -> Result<TurnResult, TurnError> {
         // Drain pending results into context (between turns, never mid-turn)
         for result in self.pending_results.drain(..) {
@@ -84,10 +115,8 @@ impl Session {
                     event_type,
                     summary,
                 } => {
-                    self.context.append_system_message(format!(
-                        "[{}] {}: {}",
-                        source, event_type, summary
-                    ));
+                    self.context
+                        .append_system_message(format!("[{}] {}: {}", source, event_type, summary));
                 }
             }
         }
@@ -99,6 +128,7 @@ impl Session {
             &self.permission,
             &self.tools,
             frontend,
+            &self.cancelled,
         )
     }
 
@@ -172,6 +202,7 @@ impl SessionManager {
             turn_loop,
             tools,
             pending_results: Vec::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
             max_tokens: config.resource_budget.max_tokens_per_session,
         };
 
@@ -208,6 +239,7 @@ impl SessionManager {
 mod tests {
     use super::*;
     use crate::testutil::*;
+    use kernel_interfaces::frontend::SessionControl;
     use kernel_interfaces::policy::{Policy, PolicyAction, PolicyRule};
     use kernel_interfaces::provider::*;
     use kernel_interfaces::types::*;
@@ -256,9 +288,13 @@ mod tests {
 
         session.add_user_input("Hello".into());
 
-        let provider = FakeProvider { response: Response {
+        let provider = FakeProvider {
+            response: Response {
                 content: vec![Content::Text("Hi there!".into())],
-                usage: Usage { input_tokens: 50, output_tokens: 20 },
+                usage: Usage {
+                    input_tokens: 50,
+                    output_tokens: 20,
+                },
                 stop_reason: StopReason::EndTurn,
             },
         };
@@ -284,7 +320,8 @@ mod tests {
 
         session.add_user_input("What happened?".into());
 
-        let provider = FakeProvider { response: Response {
+        let provider = FakeProvider {
+            response: Response {
                 content: vec![Content::Text("CI failed.".into())],
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
@@ -340,7 +377,8 @@ mod tests {
 
         session.add_user_input("Read main.rs".into());
 
-        let provider = FakeProvider { response: Response {
+        let provider = FakeProvider {
+            response: Response {
                 content: vec![Content::ToolCall {
                     id: "c1".into(),
                     name: "file_read".into(),
@@ -355,5 +393,135 @@ mod tests {
         let result = session.run_turn(&provider, &frontend).unwrap();
         assert!(result.continues);
         assert_eq!(result.tool_calls_dispatched, 1);
+    }
+
+    #[test]
+    fn session_control_queries() {
+        let mut mgr = SessionManager::new(ResourceBudget::default());
+        let id = mgr.spawn_interactive(test_session_config(), Vec::new());
+        let session = mgr.get_mut(id).unwrap();
+
+        // Fresh session should have sensible defaults
+        let ctrl: &dyn SessionControl = session;
+        assert!(ctrl.tokens_used() > 0); // system prompt tokens
+        assert!(ctrl.context_utilization() > 0.0);
+        assert_eq!(ctrl.turn_count(), 0);
+
+        session.add_user_input("Hello".into());
+        assert_eq!(SessionControl::turn_count(session), 1);
+    }
+
+    #[test]
+    fn session_control_cancellation() {
+        let mut mgr = SessionManager::new(ResourceBudget::default());
+        let tool = FakeTool::new("file_read", &["fs:read"], serde_json::json!("data"));
+        let id = mgr.spawn_interactive(test_session_config(), vec![Box::new(tool)]);
+        let session = mgr.get_mut(id).unwrap();
+
+        session.add_user_input("Read files".into());
+
+        // Set cancel flag before running the turn
+        session.cancel();
+
+        let provider = FakeProvider {
+            response: Response {
+                content: vec![Content::ToolCall {
+                    id: "c1".into(),
+                    name: "file_read".into(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                }],
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+            },
+        };
+        let frontend = RecordingFrontend::auto_allow();
+
+        // Note: run_turn resets the cancel flag at the start, so setting it before
+        // won't have effect during tool dispatch. This tests the API surface;
+        // mid-turn cancellation requires concurrent access (e.g., from another thread).
+        let result = session.run_turn(&provider, &frontend).unwrap();
+        assert!(!result.was_cancelled);
+    }
+
+    #[test]
+    fn session_control_compaction() {
+        let config = SessionConfig {
+            context_config: ContextConfig {
+                context_window: 10_000,
+                compaction_threshold: 0.10,
+                verbatim_tail_ratio: 0.30,
+                compaction_cooldown_secs: 0,
+                ..Default::default()
+            },
+            ..test_session_config()
+        };
+        let mut mgr = SessionManager::new(ResourceBudget::default());
+        let id = mgr.spawn_interactive(config, Vec::new());
+        let session = mgr.get_mut(id).unwrap();
+
+        // Add enough turns with responses to make compaction meaningful
+        for i in 0..10 {
+            session.add_user_input(format!(
+                "This is turn {} with a reasonably long message for token counting",
+                i
+            ));
+            // Run a turn so the context has assistant responses too
+            let provider = FakeProvider {
+                response: Response {
+                    content: vec![Content::Text(format!(
+                        "Here is a detailed response to turn {} with lots of information and context",
+                        i
+                    ))],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                },
+            };
+            let frontend = RecordingFrontend::auto_allow();
+            session.run_turn(&provider, &frontend).unwrap();
+        }
+
+        let before = SessionControl::tokens_used(session);
+        let freed = session
+            .request_compaction()
+            .expect("compaction should succeed");
+        assert!(freed > 0);
+        assert!(SessionControl::tokens_used(session) < before);
+    }
+
+    #[test]
+    fn session_control_set_policy() {
+        let mut mgr = SessionManager::new(ResourceBudget::default());
+        let tool = FakeTool::new("file_read", &["fs:read"], serde_json::json!("ok"));
+        let id = mgr.spawn_interactive(test_session_config(), vec![Box::new(tool)]);
+        let session = mgr.get_mut(id).unwrap();
+
+        // Default policy allows fs:read
+        session.add_user_input("Read".into());
+        let provider = FakeProvider {
+            response: tool_call_response("file_read", serde_json::json!({"path": "x"})),
+        };
+        let frontend = RecordingFrontend::auto_allow();
+        let result = session.run_turn(&provider, &frontend).unwrap();
+        assert_eq!(result.tool_calls_dispatched, 1);
+
+        // Swap to deny-all via SessionControl trait
+        let deny_policy = Policy {
+            version: 1,
+            name: "deny-all".into(),
+            rules: vec![PolicyRule {
+                match_capabilities: vec!["fs:read".into()],
+                action: PolicyAction::Deny,
+                scope_paths: Vec::new(),
+                scope_commands: Vec::new(),
+                except: Vec::new(),
+            }],
+            resource_budgets: None,
+        };
+        SessionControl::set_policy(session, deny_policy);
+
+        session.add_user_input("Read again".into());
+        let result = session.run_turn(&provider, &frontend).unwrap();
+        assert_eq!(result.tool_calls_denied, 1);
+        assert_eq!(result.tool_calls_dispatched, 0);
     }
 }

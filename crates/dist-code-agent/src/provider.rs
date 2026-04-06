@@ -12,7 +12,11 @@ use kernel_interfaces::types::{CompletionConfig, Content, Message, Prompt, Role}
 pub struct EchoProvider;
 
 impl ProviderInterface for EchoProvider {
-    fn complete(&self, prompt: &Prompt, _config: &CompletionConfig) -> Result<Response, ProviderError> {
+    fn complete(
+        &self,
+        prompt: &Prompt,
+        _config: &CompletionConfig,
+    ) -> Result<Response, ProviderError> {
         let last_user = prompt
             .messages
             .iter()
@@ -77,11 +81,7 @@ impl AnthropicProvider {
     }
 
     /// Convert our Prompt into the Anthropic Messages API request body.
-    fn build_request_body(
-        &self,
-        prompt: &Prompt,
-        config: &CompletionConfig,
-    ) -> serde_json::Value {
+    fn build_request_body(&self, prompt: &Prompt, config: &CompletionConfig) -> serde_json::Value {
         let messages = convert_messages(&prompt.messages);
         let tools = convert_tools(&prompt.tool_definitions);
 
@@ -246,12 +246,21 @@ fn convert_tools(tool_definitions: &[serde_json::Value]) -> Vec<serde_json::Valu
             // Our format: { "name": ..., "description": ..., "input_schema": ... }
             // Anthropic format: { "name": ..., "description": ..., "input_schema": ... }
             // They match — we just pass them through, ensuring the required fields exist.
-            let name = def.get("name").cloned().unwrap_or(serde_json::json!("unknown"));
-            let description = def.get("description").cloned().unwrap_or(serde_json::json!(""));
-            let input_schema = def.get("input_schema").cloned().unwrap_or(serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }));
+            let name = def
+                .get("name")
+                .cloned()
+                .unwrap_or(serde_json::json!("unknown"));
+            let description = def
+                .get("description")
+                .cloned()
+                .unwrap_or(serde_json::json!(""));
+            let input_schema = def
+                .get("input_schema")
+                .cloned()
+                .unwrap_or(serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }));
 
             serde_json::json!({
                 "name": name,

@@ -15,9 +15,17 @@ fn setup_workspace() -> tempfile::TempDir {
 
     // Create some files
     fs::write(root.join("hello.txt"), "Hello, world!\nLine 2\nLine 3\n").unwrap();
-    fs::write(root.join("main.rs"), "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+    fs::write(
+        root.join("main.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
-    fs::write(root.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    )
+    .unwrap();
 
     dir
 }
@@ -59,49 +67,80 @@ fn create_test_tools(workspace: &std::path::Path) -> Vec<Box<dyn ToolRegistratio
 
 struct TestFileRead(PathBuf);
 impl ToolRegistration for TestFileRead {
-    fn name(&self) -> &str { "file_read" }
-    fn description(&self) -> &str { "Read file contents" }
+    fn name(&self) -> &str {
+        "file_read"
+    }
+    fn description(&self) -> &str {
+        "Read file contents"
+    }
     fn capabilities(&self) -> &CapabilitySet {
         Box::leak(Box::new([Capability::new("fs:read")].into_iter().collect()))
     }
-    fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(150) }
+    fn schema(&self) -> &serde_json::Value {
+        &serde_json::Value::Null
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(150)
+    }
     fn relevance(&self) -> &RelevanceSignal {
-        Box::leak(Box::new(RelevanceSignal { keywords: vec![], tags: vec![] }))
+        Box::leak(Box::new(RelevanceSignal {
+            keywords: vec![],
+            tags: vec![],
+        }))
     }
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let path = input.get("path").and_then(|v| v.as_str())
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing path".into()))?;
         let full = self.0.join(path);
-        let content = fs::read_to_string(&full)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        Ok(ToolOutput::readonly(serde_json::json!({ "content": content })))
+        let content =
+            fs::read_to_string(&full).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        Ok(ToolOutput::readonly(
+            serde_json::json!({ "content": content }),
+        ))
     }
 }
 
 struct TestFileWrite(PathBuf);
 impl ToolRegistration for TestFileWrite {
-    fn name(&self) -> &str { "file_write" }
-    fn description(&self) -> &str { "Write file" }
-    fn capabilities(&self) -> &CapabilitySet {
-        Box::leak(Box::new([Capability::new("fs:write")].into_iter().collect()))
+    fn name(&self) -> &str {
+        "file_write"
     }
-    fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(150) }
+    fn description(&self) -> &str {
+        "Write file"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        Box::leak(Box::new(
+            [Capability::new("fs:write")].into_iter().collect(),
+        ))
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &serde_json::Value::Null
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(150)
+    }
     fn relevance(&self) -> &RelevanceSignal {
-        Box::leak(Box::new(RelevanceSignal { keywords: vec![], tags: vec![] }))
+        Box::leak(Box::new(RelevanceSignal {
+            keywords: vec![],
+            tags: vec![],
+        }))
     }
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let path = input.get("path").and_then(|v| v.as_str())
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing path".into()))?;
-        let content = input.get("content").and_then(|v| v.as_str())
+        let content = input
+            .get("content")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing content".into()))?;
         let full = self.0.join(path);
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent).ok();
         }
-        fs::write(&full, content)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        fs::write(&full, content).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
         Ok(ToolOutput::with_invalidations(
             serde_json::json!({ "written": true }),
             vec![Invalidation::Files(vec![full])],
@@ -111,21 +150,37 @@ impl ToolRegistration for TestFileWrite {
 
 struct TestShell(PathBuf);
 impl ToolRegistration for TestShell {
-    fn name(&self) -> &str { "shell" }
-    fn description(&self) -> &str { "Run shell command" }
-    fn capabilities(&self) -> &CapabilitySet {
-        Box::leak(Box::new([Capability::new("shell:exec")].into_iter().collect()))
+    fn name(&self) -> &str {
+        "shell"
     }
-    fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(200) }
+    fn description(&self) -> &str {
+        "Run shell command"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        Box::leak(Box::new(
+            [Capability::new("shell:exec")].into_iter().collect(),
+        ))
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &serde_json::Value::Null
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(200)
+    }
     fn relevance(&self) -> &RelevanceSignal {
-        Box::leak(Box::new(RelevanceSignal { keywords: vec![], tags: vec![] }))
+        Box::leak(Box::new(RelevanceSignal {
+            keywords: vec![],
+            tags: vec![],
+        }))
     }
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let cmd = input.get("command").and_then(|v| v.as_str())
+        let cmd = input
+            .get("command")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing command".into()))?;
         let output = std::process::Command::new("sh")
-            .arg("-c").arg(cmd)
+            .arg("-c")
+            .arg(cmd)
             .current_dir(&self.0)
             .output()
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
@@ -139,15 +194,26 @@ impl ToolRegistration for TestShell {
 
 struct TestLs(PathBuf);
 impl ToolRegistration for TestLs {
-    fn name(&self) -> &str { "ls" }
-    fn description(&self) -> &str { "List directory" }
+    fn name(&self) -> &str {
+        "ls"
+    }
+    fn description(&self) -> &str {
+        "List directory"
+    }
     fn capabilities(&self) -> &CapabilitySet {
         Box::leak(Box::new([Capability::new("fs:read")].into_iter().collect()))
     }
-    fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(100) }
+    fn schema(&self) -> &serde_json::Value {
+        &serde_json::Value::Null
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(100)
+    }
     fn relevance(&self) -> &RelevanceSignal {
-        Box::leak(Box::new(RelevanceSignal { keywords: vec![], tags: vec![] }))
+        Box::leak(Box::new(RelevanceSignal {
+            keywords: vec![],
+            tags: vec![],
+        }))
     }
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -157,24 +223,39 @@ impl ToolRegistration for TestLs {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        Ok(ToolOutput::readonly(serde_json::json!({ "entries": entries })))
+        Ok(ToolOutput::readonly(
+            serde_json::json!({ "entries": entries }),
+        ))
     }
 }
 
 struct TestGrep(PathBuf);
 impl ToolRegistration for TestGrep {
-    fn name(&self) -> &str { "grep" }
-    fn description(&self) -> &str { "Search files" }
+    fn name(&self) -> &str {
+        "grep"
+    }
+    fn description(&self) -> &str {
+        "Search files"
+    }
     fn capabilities(&self) -> &CapabilitySet {
         Box::leak(Box::new([Capability::new("fs:read")].into_iter().collect()))
     }
-    fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(150) }
+    fn schema(&self) -> &serde_json::Value {
+        &serde_json::Value::Null
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(150)
+    }
     fn relevance(&self) -> &RelevanceSignal {
-        Box::leak(Box::new(RelevanceSignal { keywords: vec![], tags: vec![] }))
+        Box::leak(Box::new(RelevanceSignal {
+            keywords: vec![],
+            tags: vec![],
+        }))
     }
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let pattern = input.get("pattern").and_then(|v| v.as_str())
+        let pattern = input
+            .get("pattern")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing pattern".into()))?;
         let output = std::process::Command::new("grep")
             .args(["-rn", pattern])
@@ -298,7 +379,13 @@ fn distro_write_then_read() {
     assert!(r2.continues);
 
     let results = frontend.tool_results.lock().unwrap();
-    let content = results.last().unwrap().get("content").unwrap().as_str().unwrap();
+    let content = results
+        .last()
+        .unwrap()
+        .get("content")
+        .unwrap()
+        .as_str()
+        .unwrap();
     assert!(content.contains("Created by agent-kernel"));
 }
 

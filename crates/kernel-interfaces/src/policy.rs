@@ -144,6 +144,9 @@ mod tests {
     fn first_matching_rule_wins() {
         // If we add a deny-all rule after specific allows, the allows should still work
         let policy = test_policy();
-        assert_eq!(policy.evaluate(&Capability::new("fs:read")), Decision::Allow);
+        assert_eq!(
+            policy.evaluate(&Capability::new("fs:read")),
+            Decision::Allow
+        );
     }
 }

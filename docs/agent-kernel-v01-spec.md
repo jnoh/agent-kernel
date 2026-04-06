@@ -18,7 +18,7 @@ The kernel is not an agent. It is the thing agents are built on. Different agent
 - A context manager with tiered memory and opinionated compaction
 - A permission evaluator with policy-file-driven dispatch gating
 - A session manager (single-session in v0.1, multi-session interface defined for v0.2)
-- Five stable module interfaces: ProviderInterface, ToolRegistration, ChannelInterface, FrontendInterface, PolicyInterface
+- Six stable module interfaces: ProviderInterface, ToolRegistration, ChannelInterface, FrontendEvents, SessionControl, PolicyInterface
 - Two kernel-internal tools: `request_tool` (demand-paging) and `plan` (scratchpad access)
 - Three-path tool loading: native Rust crates, external processes (JSON-RPC over stdin/stdout), MCP bridge
 - A reference TUI frontend
@@ -47,7 +47,7 @@ The kernel is not an agent. It is the thing agents are built on. Different agent
 │                                                   │
 │              FRONTENDS (control plane)             │
 │        TUI  ·  IDE Extension  ·  Web Dashboard    │
-├─────────── FrontendInterface ───────────────────┤
+├──── FrontendEvents + SessionControl ────────────┤
 │                                                   │
 │                    CORE                            │
 │  ┌─────────────────────────────────────────────┐ │
@@ -92,7 +92,7 @@ The core is defined by a single question: *what cannot be swapped out at runtime
 - Model providers — implement ProviderInterface
 - Tool implementations — implement ToolRegistration
 - Channels — implement ChannelInterface (webhooks, Slack, cron, file watchers, TUI input)
-- UI frontends — implement FrontendInterface (TUI, IDE extension, web dashboard)
+- UI frontends — implement FrontendEvents and use SessionControl (TUI, IDE extension, web dashboard)
 - Policy configurations — implement PolicyInterface
 
 ### Why microkernel-influenced, monolithic development
@@ -299,7 +299,7 @@ struct Session {
     context_manager: ContextManager,      // its own context window
     permission_evaluator: PermissionEvaluator, // its own policy
     tools: Vec<Box<dyn ToolRegistration>>,
-    frontend: Box<dyn FrontendInterface>,
+    frontend: Box<dyn FrontendEvents>,
     mode: SessionMode,                    // interactive or autonomous
     resource_budget: ResourceBudget,      // carved from global budget
     workspace: PathBuf,
@@ -313,7 +313,7 @@ struct Session {
 ```rust
 impl SessionManager {
     /// Trigger 1: Human starts a conversation
-    fn spawn_interactive(&mut self, frontend: impl FrontendInterface, config: SessionConfig) -> SessionId;
+    fn spawn_interactive(&mut self, frontend: impl FrontendEvents, config: SessionConfig) -> SessionId;
     
     /// Trigger 2: Running session spawns a child (via spawn_agent tool)
     fn spawn_child(&mut self, parent: SessionId, config: ChildSessionConfig) -> SessionId;
@@ -587,38 +587,58 @@ def git_worktree(action: str, branch: str = None, path: str = None):
 
 The SDK is a convenience, not a requirement. Any executable that reads JSON-RPC from stdin and writes JSON-RPC to stdout is a valid tool. The SDK just makes the common case trivial.
 
-### 4.3 FrontendInterface
+### 4.3 FrontendEvents + SessionControl
 
-The control plane for humans to operate the kernel. Frontends observe, manage, and control sessions — they are richer than channels. A frontend can list active sessions, switch between them, inspect context usage, view audit logs, and manage policies. The core never knows whether it's talking to a TUI, an IDE extension, or a web dashboard.
+The frontend abstraction is split into two traits: **FrontendEvents** for notifications flowing out of the kernel, and **SessionControl** for commands flowing in. The core never knows whether it's talking to a TUI, an IDE extension, or a web dashboard.
 
 ```rust
-trait FrontendInterface {
+/// Event notifications from the kernel to the frontend.
+trait FrontendEvents: Send {
     /// A new turn is starting
-    fn on_turn_start(turn_id: TurnId);
+    fn on_turn_start(&self, turn_id: TurnId);
     
     /// Streaming chunk from the model
-    fn on_stream_chunk(chunk: StreamChunk);
+    fn on_stream_chunk(&self, chunk: &StreamChunk);
+    
+    /// The model produced text output (non-streaming path)
+    fn on_text(&self, text: &str);
     
     /// A tool is being called (for display)
-    fn on_tool_call(tool: &ToolRegistration, input: &ToolInput);
+    fn on_tool_call(&self, tool_name: &str, input: &serde_json::Value);
     
     /// A tool produced a result
-    fn on_tool_result(tool: &ToolRegistration, result: &ToolResult);
+    fn on_tool_result(&self, tool_name: &str, result: &ToolOutput);
     
     /// Permission required — returns user's decision
-    fn on_permission_request(request: &PermissionRequest) -> Decision;
+    fn on_permission_request(&self, request: &PermissionRequest) -> Decision;
     
     /// The turn is complete
-    fn on_turn_end(result: &TurnResult);
+    fn on_turn_end(&self, turn_id: TurnId);
     
     /// Context was compacted (post-compaction hook)
-    fn on_compaction(summary: &CompactionSummary);
+    fn on_compaction(&self, summary: &CompactionSummary);
     
     /// The workspace root changed (e.g. worktree switch)
-    fn on_workspace_changed(new_root: &Path);
+    fn on_workspace_changed(&self, new_root: &Path);
     
     /// Error occurred
-    fn on_error(error: &KernelError);
+    fn on_error(&self, error: &KernelError);
+}
+
+/// The command surface for frontends to control a running session.
+trait SessionControl: Send {
+    // --- Queries ---
+    fn tokens_used(&self) -> usize;
+    fn context_utilization(&self) -> f64;
+    fn turn_count(&self) -> usize;
+
+    // --- Commands ---
+    /// Signal cancellation — the turn loop stops dispatching tools.
+    fn cancel(&self);
+    /// Force context compaction. Returns tokens freed.
+    fn request_compaction(&mut self) -> Result<usize, String>;
+    /// Hot-swap the active policy.
+    fn set_policy(&mut self, policy: Policy);
 }
 ```
 
@@ -761,7 +781,7 @@ Some channels are interactive (WhatsApp, Slack — the user can send follow-up m
 enum SessionMode {
     /// Human attached — can send follow-up input, answer permission prompts,
     /// cancel operations, provide clarification mid-task.
-    Interactive { frontend: Box<dyn FrontendInterface> },
+    Interactive { frontend: Box<dyn FrontendEvents> },
     
     /// No human in the loop. All decisions from policy.
     /// Permission::Ask → Permission::Deny.
@@ -1052,7 +1072,7 @@ Every commit carries metadata:
 
 ### Stable interface guarantee
 
-The five module interfaces (ProviderInterface, ToolRegistration, ChannelInterface, FrontendInterface, PolicyInterface) are versioned and follow a three-stage maturity model inspired by Kubernetes API lifecycle:
+The six module interfaces (ProviderInterface, ToolRegistration, ChannelInterface, FrontendEvents, SessionControl, PolicyInterface) are versioned and follow a three-stage maturity model inspired by Kubernetes API lifecycle:
 
 **Experimental** — opt-in only (behind a feature flag), may change or disappear without notice, not available in stable builds. New interface additions start here.
 

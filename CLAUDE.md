@@ -30,7 +30,7 @@ dist-code-agent    (depends on kernel-interfaces + kernel-core)
 
 ### Key Crates
 
-- **kernel-interfaces**: Traits (`ProviderInterface`, `ToolRegistration`, `ChannelInterface`, `FrontendInterface`, `PolicyInterface`) and shared types (`Capability`, `Content`, `ToolOutput`). This is the stable API surface.
+- **kernel-interfaces**: Traits (`ProviderInterface`, `ToolRegistration`, `ChannelInterface`, `FrontendEvents`, `SessionControl`, `PolicyInterface`) and shared types (`Capability`, `Content`, `ToolOutput`). This is the stable API surface.
 - **kernel-core**: The runtime — turn loop, context manager, permission evaluator, session manager. This is the "kernel" itself.
 - **dist-code-agent**: A reference distribution that wires together an Anthropic provider, filesystem tools, and a TUI frontend into a working coding agent binary.
 

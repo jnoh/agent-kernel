@@ -41,28 +41,26 @@ fn main() {
         default_paths
             .iter()
             .find_map(|p| load_policy_from_file(p).ok())
-            .unwrap_or_else(|| {
-                kernel_interfaces::policy::Policy {
-                    version: 1,
-                    name: "default-permissive".into(),
-                    rules: vec![
-                        kernel_interfaces::policy::PolicyRule {
-                            match_capabilities: vec!["fs:read".into(), "fs:write".into()],
-                            action: kernel_interfaces::policy::PolicyAction::Allow,
-                            scope_paths: Vec::new(),
-                            scope_commands: Vec::new(),
-                            except: Vec::new(),
-                        },
-                        kernel_interfaces::policy::PolicyRule {
-                            match_capabilities: vec!["shell:exec".into(), "net:*".into()],
-                            action: kernel_interfaces::policy::PolicyAction::Ask,
-                            scope_paths: Vec::new(),
-                            scope_commands: Vec::new(),
-                            except: Vec::new(),
-                        },
-                    ],
-                    resource_budgets: None,
-                }
+            .unwrap_or_else(|| kernel_interfaces::policy::Policy {
+                version: 1,
+                name: "default-permissive".into(),
+                rules: vec![
+                    kernel_interfaces::policy::PolicyRule {
+                        match_capabilities: vec!["fs:read".into(), "fs:write".into()],
+                        action: kernel_interfaces::policy::PolicyAction::Allow,
+                        scope_paths: Vec::new(),
+                        scope_commands: Vec::new(),
+                        except: Vec::new(),
+                    },
+                    kernel_interfaces::policy::PolicyRule {
+                        match_capabilities: vec!["shell:exec".into(), "net:*".into()],
+                        action: kernel_interfaces::policy::PolicyAction::Ask,
+                        scope_paths: Vec::new(),
+                        scope_commands: Vec::new(),
+                        except: Vec::new(),
+                    },
+                ],
+                resource_budgets: None,
             })
     };
 

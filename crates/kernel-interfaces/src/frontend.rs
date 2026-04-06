@@ -25,9 +25,9 @@ pub struct KernelError {
     pub recoverable: bool,
 }
 
-/// The control plane for humans to operate the kernel.
+/// Event notifications from the kernel to the frontend.
 /// The core never knows whether it's talking to a TUI, IDE extension, or web dashboard.
-pub trait FrontendInterface: Send {
+pub trait FrontendEvents: Send {
     /// A new turn is starting.
     fn on_turn_start(&self, turn_id: TurnId);
 
@@ -57,4 +57,21 @@ pub trait FrontendInterface: Send {
 
     /// Error occurred.
     fn on_error(&self, error: &KernelError);
+}
+
+/// The command surface for frontends to control a running session.
+/// Complements FrontendEvents: events flow out, commands flow in.
+pub trait SessionControl: Send {
+    // --- Queries ---
+    fn tokens_used(&self) -> usize;
+    fn context_utilization(&self) -> f64;
+    fn turn_count(&self) -> usize;
+
+    // --- Commands ---
+    /// Signal cancellation — the turn loop should stop dispatching tools.
+    fn cancel(&self);
+    /// Force context compaction. Returns tokens freed.
+    fn request_compaction(&mut self) -> Result<usize, String>;
+    /// Hot-swap the active policy.
+    fn set_policy(&mut self, policy: crate::policy::Policy);
 }

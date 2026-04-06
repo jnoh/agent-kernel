@@ -1,7 +1,5 @@
 use kernel_interfaces::tool::ToolRegistration;
-use kernel_interfaces::types::{
-    Content, Invalidation, Message, Prompt, Role,
-};
+use kernel_interfaces::types::{Content, Invalidation, Message, Prompt, Role};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -275,7 +273,11 @@ impl ContextManager {
 
     /// Remove a tool's definition from context.
     pub fn page_out_tool(&mut self, tool_name: &str) -> bool {
-        if let Some(idx) = self.tool_names_in_context.iter().position(|n| n == tool_name) {
+        if let Some(idx) = self
+            .tool_names_in_context
+            .iter()
+            .position(|n| n == tool_name)
+        {
             self.tool_definitions_in_context.remove(idx);
             self.tool_names_in_context.remove(idx);
             // Token reclaim is approximate — we don't track per-tool cost after insertion.
@@ -614,7 +616,9 @@ mod tests {
         };
         let mut cm = ContextManager::new(config, "System.".into());
 
-        cm.scratchpad_mut().constraints.push("Don't modify auth module".into());
+        cm.scratchpad_mut()
+            .constraints
+            .push("Don't modify auth module".into());
         cm.scratchpad_mut().plan.push(PlanStep {
             description: "Fix the bug".into(),
             completed: false,
@@ -666,17 +670,32 @@ mod tests {
             fn new() -> Self {
                 Self {
                     capabilities: CapabilitySet::new(),
-                    relevance: RelevanceSignal { keywords: Vec::new(), tags: Vec::new() },
+                    relevance: RelevanceSignal {
+                        keywords: Vec::new(),
+                        tags: Vec::new(),
+                    },
                 }
             }
         }
         impl ToolRegistration for BigTool {
-            fn name(&self) -> &str { "big_tool" }
-            fn description(&self) -> &str { "A huge tool" }
-            fn capabilities(&self) -> &CapabilitySet { &self.capabilities }
-            fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-            fn cost(&self) -> TokenEstimate { TokenEstimate(999_999) }
-            fn relevance(&self) -> &RelevanceSignal { &self.relevance }
+            fn name(&self) -> &str {
+                "big_tool"
+            }
+            fn description(&self) -> &str {
+                "A huge tool"
+            }
+            fn capabilities(&self) -> &CapabilitySet {
+                &self.capabilities
+            }
+            fn schema(&self) -> &serde_json::Value {
+                &serde_json::Value::Null
+            }
+            fn cost(&self) -> TokenEstimate {
+                TokenEstimate(999_999)
+            }
+            fn relevance(&self) -> &RelevanceSignal {
+                &self.relevance
+            }
             fn execute(&self, _: serde_json::Value) -> Result<ToolOutput, ToolError> {
                 unreachable!()
             }

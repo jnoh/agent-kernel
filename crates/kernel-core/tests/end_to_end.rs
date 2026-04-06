@@ -247,11 +247,7 @@ fn e2e_policy_enforcement() {
     let mut mgr = SessionManager::new(ResourceBudget::default());
     let id = mgr.spawn_interactive(
         session_config(lockdown_policy()),
-        vec![
-            Box::new(file_read),
-            Box::new(shell),
-            Box::new(file_write),
-        ],
+        vec![Box::new(file_read), Box::new(shell), Box::new(file_write)],
     );
     let session = mgr.get_mut(id).unwrap();
 
@@ -310,11 +306,7 @@ fn e2e_policy_user_denies_write() {
     let mut mgr = SessionManager::new(ResourceBudget::default());
     let id = mgr.spawn_interactive(
         session_config(lockdown_policy()),
-        vec![
-            Box::new(file_read),
-            Box::new(shell),
-            Box::new(file_write),
-        ],
+        vec![Box::new(file_read), Box::new(shell), Box::new(file_write)],
     );
     let session = mgr.get_mut(id).unwrap();
 
@@ -363,10 +355,7 @@ fn e2e_policy_hot_swap() {
     );
 
     let mut mgr = SessionManager::new(ResourceBudget::default());
-    let id = mgr.spawn_interactive(
-        session_config(allow_all_policy()),
-        vec![Box::new(shell)],
-    );
+    let id = mgr.spawn_interactive(session_config(allow_all_policy()), vec![Box::new(shell)]);
     let session = mgr.get_mut(id).unwrap();
 
     // Turn 1: permissive policy, shell allowed
@@ -383,7 +372,10 @@ fn e2e_policy_hot_swap() {
     let frontend = RecordingFrontend::auto_allow();
 
     let r1 = session.run_turn(&provider1, &frontend).unwrap();
-    assert_eq!(r1.tool_calls_dispatched, 1, "shell allowed under permissive");
+    assert_eq!(
+        r1.tool_calls_dispatched, 1,
+        "shell allowed under permissive"
+    );
 
     // Swap to lockdown policy
     session.set_policy(lockdown_policy());
@@ -457,7 +449,9 @@ fn e2e_child_completion_delivery() {
     session.add_user_input("How did the lint check go?".into());
 
     let provider = ScriptedProvider::new(vec![Response {
-        content: vec![Content::Text("The lint check found and fixed 2 issues.".into())],
+        content: vec![Content::Text(
+            "The lint check found and fixed 2 issues.".into(),
+        )],
         usage: Usage::default(),
         stop_reason: StopReason::EndTurn,
     }]);
@@ -546,17 +540,15 @@ fn e2e_full_agent_workflow() {
     let mut mgr = SessionManager::new(ResourceBudget::default());
     let id = mgr.spawn_interactive(
         session_config(allow_all_policy()),
-        vec![
-            Box::new(file_read),
-            Box::new(file_edit),
-            Box::new(shell),
-        ],
+        vec![Box::new(file_read), Box::new(file_edit), Box::new(shell)],
     );
     let session = mgr.get_mut(id).unwrap();
     let frontend = RecordingFrontend::auto_allow();
 
     // Turn 1: User asks to fix the bug
-    session.add_user_input("The add function in src/math.rs has a bug. Fix it and run the tests.".into());
+    session.add_user_input(
+        "The add function in src/math.rs has a bug. Fix it and run the tests.".into(),
+    );
 
     // Model reads the file
     let provider1 = ScriptedProvider::new(vec![Response {
@@ -646,17 +638,31 @@ fn e2e_tool_execution_error() {
     // Override with a tool that always fails
     struct FailingTool;
     impl ToolRegistration for FailingTool {
-        fn name(&self) -> &str { "buggy_tool" }
-        fn description(&self) -> &str { "always fails" }
+        fn name(&self) -> &str {
+            "buggy_tool"
+        }
+        fn description(&self) -> &str {
+            "always fails"
+        }
         fn capabilities(&self) -> &CapabilitySet {
             Box::leak(Box::new(
-                ["fs:read"].iter().map(|c| Capability::new(*c)).collect::<CapabilitySet>()
+                ["fs:read"]
+                    .iter()
+                    .map(|c| Capability::new(*c))
+                    .collect::<CapabilitySet>(),
             ))
         }
-        fn schema(&self) -> &serde_json::Value { &serde_json::Value::Null }
-        fn cost(&self) -> TokenEstimate { TokenEstimate(10) }
+        fn schema(&self) -> &serde_json::Value {
+            &serde_json::Value::Null
+        }
+        fn cost(&self) -> TokenEstimate {
+            TokenEstimate(10)
+        }
         fn relevance(&self) -> &RelevanceSignal {
-            Box::leak(Box::new(RelevanceSignal { keywords: Vec::new(), tags: Vec::new() }))
+            Box::leak(Box::new(RelevanceSignal {
+                keywords: Vec::new(),
+                tags: Vec::new(),
+            }))
         }
         fn execute(&self, _: serde_json::Value) -> Result<ToolOutput, ToolError> {
             Err(ToolError::ExecutionFailed("disk on fire".into()))

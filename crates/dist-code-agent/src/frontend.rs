@@ -1,7 +1,7 @@
 //! Simple REPL frontend for the code-agent distribution.
 
 use kernel_interfaces::frontend::{
-    CompactionSummary, FrontendInterface, KernelError, PermissionRequest,
+    CompactionSummary, FrontendEvents, KernelError, PermissionRequest,
 };
 use kernel_interfaces::tool::ToolOutput;
 use kernel_interfaces::types::{Decision, StreamChunk, TurnId};
@@ -12,7 +12,7 @@ use std::path::Path;
 /// A minimal terminal frontend that prints events and prompts for permissions.
 pub struct ReplFrontend;
 
-impl FrontendInterface for ReplFrontend {
+impl FrontendEvents for ReplFrontend {
     fn on_turn_start(&self, _turn_id: TurnId) {}
 
     fn on_text(&self, text: &str) {

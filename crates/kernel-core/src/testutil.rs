@@ -1,7 +1,7 @@
 //! Shared test doubles for kernel-core tests.
 //!
 //! Provides reusable fake implementations of ProviderInterface, ToolRegistration,
-//! and FrontendInterface to avoid duplicating test doubles across modules.
+//! and FrontendEvents to avoid duplicating test doubles across modules.
 
 use kernel_interfaces::frontend::*;
 use kernel_interfaces::policy::{Policy, PolicyAction, PolicyRule};
@@ -10,8 +10,8 @@ use kernel_interfaces::tool::*;
 use kernel_interfaces::types::*;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ============================================================================
 // Provider doubles
@@ -238,7 +238,7 @@ impl RecordingFrontend {
     }
 }
 
-impl FrontendInterface for RecordingFrontend {
+impl FrontendEvents for RecordingFrontend {
     fn on_turn_start(&self, _: TurnId) {
         self.turns_started.fetch_add(1, Ordering::Relaxed);
     }
@@ -248,7 +248,10 @@ impl FrontendInterface for RecordingFrontend {
         self.tool_calls.lock().unwrap().push(name.into());
     }
     fn on_tool_result(&self, _: &str, result: &ToolOutput) {
-        self.tool_results.lock().unwrap().push(result.result.clone());
+        self.tool_results
+            .lock()
+            .unwrap()
+            .push(result.result.clone());
     }
     fn on_permission_request(&self, request: &PermissionRequest) -> Decision {
         self.permission_requests

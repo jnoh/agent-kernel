@@ -33,7 +33,13 @@ impl FileReadTool {
                 "required": ["path"]
             }),
             relevance: RelevanceSignal {
-                keywords: vec!["read".into(), "file".into(), "cat".into(), "show".into(), "contents".into()],
+                keywords: vec![
+                    "read".into(),
+                    "file".into(),
+                    "cat".into(),
+                    "show".into(),
+                    "contents".into(),
+                ],
                 tags: vec!["filesystem".into()],
             },
             workspace,
@@ -46,25 +52,42 @@ impl FileReadTool {
 }
 
 impl ToolRegistration for FileReadTool {
-    fn name(&self) -> &str { "file_read" }
-    fn description(&self) -> &str { "Read file contents with optional line range" }
-    fn capabilities(&self) -> &CapabilitySet { &self.caps }
-    fn schema(&self) -> &serde_json::Value { &self.schema }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(150) }
-    fn relevance(&self) -> &RelevanceSignal { &self.relevance }
+    fn name(&self) -> &str {
+        "file_read"
+    }
+    fn description(&self) -> &str {
+        "Read file contents with optional line range"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        &self.caps
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(150)
+    }
+    fn relevance(&self) -> &RelevanceSignal {
+        &self.relevance
+    }
 
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let path_str = input.get("path")
+        let path_str = input
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing 'path' parameter".into()))?;
 
         let full_path = self.resolve_path(path_str);
-        let content = std::fs::read_to_string(&full_path)
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to read {}: {e}", full_path.display())))?;
+        let content = std::fs::read_to_string(&full_path).map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to read {}: {e}", full_path.display()))
+        })?;
 
         let lines: Vec<&str> = content.lines().collect();
         let offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-        let limit = input.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let limit = input
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         let start = offset.saturating_sub(1).min(lines.len());
         let end = match limit {
@@ -119,18 +142,32 @@ impl FileWriteTool {
 }
 
 impl ToolRegistration for FileWriteTool {
-    fn name(&self) -> &str { "file_write" }
-    fn description(&self) -> &str { "Write full file contents" }
-    fn capabilities(&self) -> &CapabilitySet { &self.caps }
-    fn schema(&self) -> &serde_json::Value { &self.schema }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(150) }
-    fn relevance(&self) -> &RelevanceSignal { &self.relevance }
+    fn name(&self) -> &str {
+        "file_write"
+    }
+    fn description(&self) -> &str {
+        "Write full file contents"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        &self.caps
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(150)
+    }
+    fn relevance(&self) -> &RelevanceSignal {
+        &self.relevance
+    }
 
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let path_str = input.get("path")
+        let path_str = input
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing 'path'".into()))?;
-        let content = input.get("content")
+        let content = input
+            .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing 'content'".into()))?;
 
@@ -138,12 +175,14 @@ impl ToolRegistration for FileWriteTool {
 
         // Create parent directories if needed
         if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ToolError::ExecutionFailed(format!("failed to create directories: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ToolError::ExecutionFailed(format!("failed to create directories: {e}"))
+            })?;
         }
 
-        std::fs::write(&full_path, content)
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to write {}: {e}", full_path.display())))?;
+        std::fs::write(&full_path, content).map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to write {}: {e}", full_path.display()))
+        })?;
 
         Ok(ToolOutput::with_invalidations(
             serde_json::json!({ "path": path_str, "bytes_written": content.len() }),
@@ -175,7 +214,13 @@ impl ShellTool {
                 "required": ["command"]
             }),
             relevance: RelevanceSignal {
-                keywords: vec!["run".into(), "exec".into(), "shell".into(), "command".into(), "bash".into()],
+                keywords: vec![
+                    "run".into(),
+                    "exec".into(),
+                    "shell".into(),
+                    "command".into(),
+                    "bash".into(),
+                ],
                 tags: vec!["shell".into()],
             },
             workspace,
@@ -184,15 +229,28 @@ impl ShellTool {
 }
 
 impl ToolRegistration for ShellTool {
-    fn name(&self) -> &str { "shell" }
-    fn description(&self) -> &str { "Execute a shell command in the workspace" }
-    fn capabilities(&self) -> &CapabilitySet { &self.caps }
-    fn schema(&self) -> &serde_json::Value { &self.schema }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(200) }
-    fn relevance(&self) -> &RelevanceSignal { &self.relevance }
+    fn name(&self) -> &str {
+        "shell"
+    }
+    fn description(&self) -> &str {
+        "Execute a shell command in the workspace"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        &self.caps
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(200)
+    }
+    fn relevance(&self) -> &RelevanceSignal {
+        &self.relevance
+    }
 
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let command = input.get("command")
+        let command = input
+            .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing 'command'".into()))?;
 
@@ -209,7 +267,11 @@ impl ToolRegistration for ShellTool {
         // Truncate large outputs
         let max_len = 50_000;
         let stdout_truncated = if stdout.len() > max_len {
-            format!("{}...\n[truncated, {} total bytes]", &stdout[..max_len], stdout.len())
+            format!(
+                "{}...\n[truncated, {} total bytes]",
+                &stdout[..max_len],
+                stdout.len()
+            )
         } else {
             stdout.into_owned()
         };
@@ -244,7 +306,12 @@ impl LsTool {
                 }
             }),
             relevance: RelevanceSignal {
-                keywords: vec!["list".into(), "ls".into(), "directory".into(), "files".into()],
+                keywords: vec![
+                    "list".into(),
+                    "ls".into(),
+                    "directory".into(),
+                    "files".into(),
+                ],
                 tags: vec!["filesystem".into()],
             },
             workspace,
@@ -253,12 +320,24 @@ impl LsTool {
 }
 
 impl ToolRegistration for LsTool {
-    fn name(&self) -> &str { "ls" }
-    fn description(&self) -> &str { "List directory contents" }
-    fn capabilities(&self) -> &CapabilitySet { &self.caps }
-    fn schema(&self) -> &serde_json::Value { &self.schema }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(100) }
-    fn relevance(&self) -> &RelevanceSignal { &self.relevance }
+    fn name(&self) -> &str {
+        "ls"
+    }
+    fn description(&self) -> &str {
+        "List directory contents"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        &self.caps
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(100)
+    }
+    fn relevance(&self) -> &RelevanceSignal {
+        &self.relevance
+    }
 
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
         let path_str = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -308,7 +387,12 @@ impl GrepTool {
                 "required": ["pattern"]
             }),
             relevance: RelevanceSignal {
-                keywords: vec!["search".into(), "grep".into(), "find".into(), "where".into()],
+                keywords: vec![
+                    "search".into(),
+                    "grep".into(),
+                    "find".into(),
+                    "where".into(),
+                ],
                 tags: vec!["search".into()],
             },
             workspace,
@@ -317,15 +401,28 @@ impl GrepTool {
 }
 
 impl ToolRegistration for GrepTool {
-    fn name(&self) -> &str { "grep" }
-    fn description(&self) -> &str { "Search file contents with grep" }
-    fn capabilities(&self) -> &CapabilitySet { &self.caps }
-    fn schema(&self) -> &serde_json::Value { &self.schema }
-    fn cost(&self) -> TokenEstimate { TokenEstimate(150) }
-    fn relevance(&self) -> &RelevanceSignal { &self.relevance }
+    fn name(&self) -> &str {
+        "grep"
+    }
+    fn description(&self) -> &str {
+        "Search file contents with grep"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        &self.caps
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(150)
+    }
+    fn relevance(&self) -> &RelevanceSignal {
+        &self.relevance
+    }
 
     fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let pattern = input.get("pattern")
+        let pattern = input
+            .get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("missing 'pattern'".into()))?;
         let path_str = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");

@@ -68,7 +68,11 @@ pub enum StopReason {
 /// it never touches provider-specific APIs.
 pub trait ProviderInterface {
     /// Blocking completion.
-    fn complete(&self, prompt: &Prompt, config: &CompletionConfig) -> Result<Response, ProviderError>;
+    fn complete(
+        &self,
+        prompt: &Prompt,
+        config: &CompletionConfig,
+    ) -> Result<Response, ProviderError>;
 
     /// Token counting for budget management.
     fn count_tokens(&self, content: &Content) -> usize;

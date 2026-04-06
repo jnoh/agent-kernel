@@ -46,9 +46,11 @@ The kernel provides four core primitives no existing framework unifies: tiered c
 
 3. **ChannelInterface** — how external events enter the kernel (data plane). Channels are pluggable modules that produce events: webhooks, Slack, WhatsApp, cron, file watchers, TUI input. They translate external protocols into ExternalEvent and hand to session manager.
 
-4. **FrontendInterface** — how humans manage the system (control plane). Rich, bidirectional. Can list sessions, switch between them, inspect context, view audit logs, manage policies, promote autonomous→interactive. Distinct from channels: channels create sessions and deliver events; frontends observe, manage, and control sessions.
+4. **FrontendEvents** — event notifications from the kernel to the frontend (display plane). All methods are `on_*` callbacks: turn start/end, tool calls, permission requests, compaction, errors. The core never knows whether it's talking to a TUI, IDE extension, or web dashboard.
 
-5. **PolicyInterface** — external policy configuration (YAML files). Mechanism/policy separation: same binary, different policy file = developer laptop vs enterprise CI.
+5. **SessionControl** — the command surface for frontends to control a running session (control plane). Queries (tokens_used, context_utilization, turn_count) and commands (cancel, request_compaction, set_policy). Complements FrontendEvents: events flow out, commands flow in. Distinct from channels: channels create sessions and deliver events; frontends observe, manage, and control sessions via SessionControl.
+
+6. **PolicyInterface** — external policy configuration (YAML files). Mechanism/policy separation: same binary, different policy file = developer laptop vs enterprise CI.
 
 ### Invalidation Protocol (part of ToolRegistration):
 Every `ToolOutput` includes optional `invalidations` vector:
