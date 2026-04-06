@@ -1,0 +1,25 @@
+version: 1
+name: ci-lockdown
+
+rules:
+  - match:
+      - "fs:read"
+    action: allow
+
+  - match:
+      - "fs:write"
+    action: allow
+
+  - match:
+      - "shell:exec"
+    action: allow
+
+  - match:
+      - "net:*"
+    action: deny
+
+resource_budgets:
+  max_tokens_per_session: 500000
+  max_tool_invocations_per_turn: 10
+  max_wall_time_per_tool_secs: 60
+  max_output_size_bytes: 51200

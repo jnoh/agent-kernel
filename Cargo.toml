@@ -2,6 +2,7 @@
 members = [
     "crates/kernel-interfaces",
     "crates/kernel-core",
+    "crates/dist-code-agent",
 ]
 resolver = "2"
 

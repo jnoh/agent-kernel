@@ -1,0 +1,25 @@
+version: 1
+name: developer-permissive
+
+rules:
+  - match:
+      - "fs:read"
+    action: allow
+
+  - match:
+      - "fs:write"
+    action: allow
+
+  - match:
+      - "shell:exec"
+    action: ask
+
+  - match:
+      - "net:*"
+    action: ask
+
+resource_budgets:
+  max_tokens_per_session: 1000000
+  max_tool_invocations_per_turn: 20
+  max_wall_time_per_tool_secs: 120
+  max_output_size_bytes: 102400
