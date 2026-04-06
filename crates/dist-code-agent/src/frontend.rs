@@ -15,6 +15,10 @@ pub struct ReplFrontend;
 impl FrontendInterface for ReplFrontend {
     fn on_turn_start(&self, _turn_id: TurnId) {}
 
+    fn on_text(&self, text: &str) {
+        println!("{text}");
+    }
+
     fn on_stream_chunk(&self, _chunk: &StreamChunk) {}
 
     fn on_tool_call(&self, tool_name: &str, input: &serde_json::Value) {

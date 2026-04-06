@@ -153,9 +153,11 @@ impl TurnLoop {
         // 3. Parse tool calls from response
         let (text_parts, tool_calls) = parse_response(&response);
 
-        // Record assistant text response
+        // Record assistant text response and surface to frontend
         if !text_parts.is_empty() {
-            context.append_assistant_response(text_parts.join(""));
+            let text = text_parts.join("");
+            frontend.on_text(&text);
+            context.append_assistant_response(text);
         }
 
         // 4. Dispatch tool calls through permission evaluator

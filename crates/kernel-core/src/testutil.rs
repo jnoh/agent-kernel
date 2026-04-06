@@ -242,6 +242,7 @@ impl FrontendInterface for RecordingFrontend {
     fn on_turn_start(&self, _: TurnId) {
         self.turns_started.fetch_add(1, Ordering::Relaxed);
     }
+    fn on_text(&self, _: &str) {}
     fn on_stream_chunk(&self, _: &StreamChunk) {}
     fn on_tool_call(&self, name: &str, _: &serde_json::Value) {
         self.tool_calls.lock().unwrap().push(name.into());

@@ -34,6 +34,9 @@ pub trait FrontendInterface: Send {
     /// Streaming chunk from the model.
     fn on_stream_chunk(&self, chunk: &StreamChunk);
 
+    /// The model produced text output (non-streaming path).
+    fn on_text(&self, text: &str);
+
     /// A tool is being called.
     fn on_tool_call(&self, tool_name: &str, input: &serde_json::Value);
 
