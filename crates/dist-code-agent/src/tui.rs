@@ -90,6 +90,14 @@ pub struct App {
     pub awaiting_permission: bool,
     /// The request_id of the pending permission (if any).
     pub pending_permission_request_id: Option<u64>,
+
+    // --- Input history ---
+    /// Past submitted inputs (oldest first).
+    history: Vec<String>,
+    /// Current position in history (None = editing new input, Some(i) = browsing).
+    history_index: Option<usize>,
+    /// Stash of the in-progress input when browsing history.
+    history_stash: String,
 }
 
 impl App {
@@ -109,6 +117,9 @@ impl App {
             spinner_tick: 0,
             awaiting_permission: false,
             pending_permission_request_id: None,
+            history: Vec::new(),
+            history_index: None,
+            history_stash: String::new(),
         }
     }
 
@@ -172,9 +183,58 @@ impl App {
 
     pub fn take_input(&mut self) -> String {
         let text = self.input.clone();
+        if !text.is_empty() {
+            self.history.push(text.clone());
+        }
         self.input.clear();
         self.cursor = 0;
+        self.history_index = None;
+        self.history_stash.clear();
         text
+    }
+
+    // --- History navigation ---
+
+    /// Navigate to the previous (older) history entry.
+    pub fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        match self.history_index {
+            None => {
+                // Entering history mode — stash current input
+                self.history_stash = self.input.clone();
+                let idx = self.history.len() - 1;
+                self.history_index = Some(idx);
+                self.input = self.history[idx].clone();
+            }
+            Some(idx) if idx > 0 => {
+                let idx = idx - 1;
+                self.history_index = Some(idx);
+                self.input = self.history[idx].clone();
+            }
+            _ => {} // Already at oldest entry
+        }
+        self.cursor = self.input.len();
+    }
+
+    /// Navigate to the next (newer) history entry, or back to the stashed input.
+    pub fn history_next(&mut self) {
+        match self.history_index {
+            Some(idx) if idx + 1 < self.history.len() => {
+                let idx = idx + 1;
+                self.history_index = Some(idx);
+                self.input = self.history[idx].clone();
+            }
+            Some(_) => {
+                // Past the newest entry — restore stash
+                self.history_index = None;
+                self.input = self.history_stash.clone();
+                self.history_stash.clear();
+            }
+            None => {} // Not in history mode
+        }
+        self.cursor = self.input.len();
     }
 
     // --- Scroll helpers ---
@@ -207,13 +267,17 @@ const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
+    // Input area height: 1 border + number of lines in input (min 1, max 8)
+    let input_line_count = app.input.lines().count().clamp(1, 8) as u16;
+    let input_height = input_line_count + 1; // +1 for top border
+
     // Layout: [status_bar | conversation | input_area]
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // status bar
-            Constraint::Min(5),    // conversation
-            Constraint::Length(3), // input area
+            Constraint::Length(1),            // status bar
+            Constraint::Min(5),               // conversation
+            Constraint::Length(input_height), // input area (dynamic)
         ])
         .split(size);
 
@@ -268,9 +332,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
 
             ConversationEntry::AssistantText(text) => {
                 lines.push(Line::from(""));
-                for l in text.lines() {
-                    lines.push(Line::from(Span::raw(l.to_string())));
-                }
+                lines.extend(markdown_to_lines(text));
             }
 
             ConversationEntry::ToolCall {
@@ -410,28 +472,48 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(conversation, area);
 }
 
+const SPINNER_PROMPTS: &[&str] = &[
+    " ⠋ ", " ⠙ ", " ⠹ ", " ⠸ ", " ⠼ ", " ⠴ ", " ⠦ ", " ⠧ ", " ⠇ ", " ⠏ ",
+];
+
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let prompt = if app.awaiting_permission {
         " [y/n] "
     } else if app.turn_active {
-        let ch = SPINNER[app.spinner_tick % SPINNER.len()];
-        // Can't easily return owned string with lifetime, use a static prompt
-        // for active turns
-        Box::leak(format!(" {ch} ").into_boxed_str())
+        SPINNER_PROMPTS[app.spinner_tick % SPINNER_PROMPTS.len()]
     } else {
         " > "
     };
 
-    let input_paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(
-            prompt.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(app.input.clone()),
-    ]))
-    .block(
+    let prompt_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    // Build lines: first line gets the prompt, subsequent lines get indent
+    let input_lines: Vec<&str> = if app.input.is_empty() {
+        vec![""]
+    } else {
+        app.input.split('\n').collect()
+    };
+
+    let mut text_lines: Vec<Line<'_>> = Vec::new();
+    for (i, line) in input_lines.iter().enumerate() {
+        if i == 0 {
+            text_lines.push(Line::from(vec![
+                Span::styled(prompt.to_string(), prompt_style),
+                Span::raw(line.to_string()),
+            ]));
+        } else {
+            // Indent continuation lines to align with first line content
+            let indent = " ".repeat(prompt.len());
+            text_lines.push(Line::from(vec![
+                Span::styled(indent, Style::default()),
+                Span::raw(line.to_string()),
+            ]));
+        }
+    }
+
+    let input_paragraph = Paragraph::new(text_lines).block(
         Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::DarkGray)),
@@ -439,10 +521,22 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(input_paragraph, area);
 
-    // Position cursor
-    let cursor_x = area.x + prompt.len() as u16 + app.cursor as u16;
-    let cursor_y = area.y + 1; // after top border
+    // Position cursor: find which line and column the cursor is on
+    let (cursor_row, cursor_col) = cursor_position_in_input(&app.input, app.cursor);
+    let cursor_x = area.x + prompt.len() as u16 + cursor_col as u16;
+    let cursor_y = area.y + 1 + cursor_row as u16; // +1 for top border
     frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+/// Compute (row, col) of the byte cursor within a multiline input string.
+fn cursor_position_in_input(input: &str, cursor: usize) -> (usize, usize) {
+    let before_cursor = &input[..cursor.min(input.len())];
+    let row = before_cursor.matches('\n').count();
+    let col = match before_cursor.rfind('\n') {
+        Some(pos) => cursor - pos - 1,
+        None => cursor,
+    };
+    (row, col)
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +604,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
     }
 
     match key.code {
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.insert_char('\n');
+            InputAction::None
+        }
         KeyCode::Enter => {
             let text = app.take_input();
             if text.is_empty() {
@@ -548,12 +646,20 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
             app.move_end();
             InputAction::None
         }
-        KeyCode::Up => {
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.scroll_up(3);
             InputAction::None
         }
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_down(3, 20);
+            InputAction::None
+        }
+        KeyCode::Up => {
+            app.history_prev();
+            InputAction::None
+        }
         KeyCode::Down => {
-            app.scroll_down(3, 20); // approximate; exact viewport set during draw
+            app.history_next();
             InputAction::None
         }
         KeyCode::PageUp => {
@@ -566,4 +672,164 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
         }
         _ => InputAction::None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Markdown → ratatui Lines
+// ---------------------------------------------------------------------------
+
+/// Convert a markdown string into styled ratatui Lines.
+/// Supports: headers, bold, italic, inline code, fenced code blocks, lists.
+fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    let parser = Parser::new_ext(md, Options::all());
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+
+    // Style stack for nested formatting (bold inside italic, etc.)
+    let mut bold = false;
+    let mut italic = false;
+    let mut in_code_block = false;
+    let mut code_block_buf = String::new();
+    let mut heading_level: Option<u8> = None;
+    let mut list_depth: usize = 0;
+
+    let flush_line = |spans: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>| {
+        if !spans.is_empty() {
+            lines.push(Line::from(std::mem::take(spans)));
+        }
+    };
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                flush_line(&mut current_spans, &mut lines);
+                heading_level = Some(level as u8);
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                flush_line(&mut current_spans, &mut lines);
+                heading_level = None;
+            }
+
+            Event::Start(Tag::Emphasis) => italic = true,
+            Event::End(TagEnd::Emphasis) => italic = false,
+
+            Event::Start(Tag::Strong) => bold = true,
+            Event::End(TagEnd::Strong) => bold = false,
+
+            Event::Start(Tag::CodeBlock(_)) => {
+                flush_line(&mut current_spans, &mut lines);
+                in_code_block = true;
+                code_block_buf.clear();
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                // Render code block with background styling
+                for code_line in code_block_buf.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {code_line}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                in_code_block = false;
+                code_block_buf.clear();
+            }
+
+            Event::Start(Tag::List(_)) => list_depth += 1,
+            Event::End(TagEnd::List(_)) => {
+                list_depth = list_depth.saturating_sub(1);
+            }
+
+            Event::Start(Tag::Item) => {
+                flush_line(&mut current_spans, &mut lines);
+                let indent = "  ".repeat(list_depth);
+                current_spans.push(Span::styled(
+                    format!("{indent}• "),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            Event::End(TagEnd::Item) => {
+                flush_line(&mut current_spans, &mut lines);
+            }
+
+            Event::Start(Tag::Paragraph) => {
+                flush_line(&mut current_spans, &mut lines);
+            }
+            Event::End(TagEnd::Paragraph) => {
+                flush_line(&mut current_spans, &mut lines);
+            }
+
+            Event::Code(text) => {
+                current_spans.push(Span::styled(
+                    format!("`{text}`"),
+                    Style::default().fg(Color::Green),
+                ));
+            }
+
+            Event::Text(text) => {
+                if in_code_block {
+                    code_block_buf.push_str(&text);
+                } else {
+                    let style = if let Some(level) = heading_level {
+                        match level {
+                            1 => Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                            2 => Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                            _ => Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        }
+                    } else if bold && italic {
+                        Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC)
+                    } else if bold {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else if italic {
+                        Style::default().add_modifier(Modifier::ITALIC)
+                    } else {
+                        Style::default()
+                    };
+
+                    // Split on newlines to handle multi-line text events
+                    let text_str = text.to_string();
+                    let mut line_iter = text_str.split('\n');
+                    if let Some(first) = line_iter.next()
+                        && !first.is_empty()
+                    {
+                        current_spans.push(Span::styled(first.to_string(), style));
+                    }
+                    for subsequent in line_iter {
+                        flush_line(&mut current_spans, &mut lines);
+                        if !subsequent.is_empty() {
+                            current_spans.push(Span::styled(subsequent.to_string(), style));
+                        }
+                    }
+                }
+            }
+
+            Event::SoftBreak => {
+                current_spans.push(Span::raw(" "));
+            }
+            Event::HardBreak => {
+                flush_line(&mut current_spans, &mut lines);
+            }
+
+            Event::Rule => {
+                flush_line(&mut current_spans, &mut lines);
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(40),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            _ => {}
+        }
+    }
+
+    // Flush any remaining spans
+    flush_line(&mut current_spans, &mut lines);
+
+    lines
 }
