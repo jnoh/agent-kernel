@@ -12,6 +12,154 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
+// ---------------------------------------------------------------------------
+// Tool display formatting
+// ---------------------------------------------------------------------------
+
+/// Format a tool's input JSON into a human-readable one-liner.
+fn format_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
+    match tool_name {
+        "file_read" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let mut s = path.to_string();
+            if let Some(offset) = input.get("offset").and_then(|v| v.as_u64()) {
+                if let Some(limit) = input.get("limit").and_then(|v| v.as_u64()) {
+                    s.push_str(&format!(" (lines {}-{})", offset, offset + limit));
+                } else {
+                    s.push_str(&format!(" (from line {})", offset));
+                }
+            }
+            s
+        }
+        "file_write" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let content_len = input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            format!("{path} ({content_len} bytes)")
+        }
+        "shell" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string(),
+        "grep" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("/{pattern}/ in {path}")
+        }
+        "ls" => input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".")
+            .to_string(),
+        _ => {
+            let s = input.to_string();
+            if s.len() > 120 {
+                format!("{}...", &s[..120])
+            } else {
+                s
+            }
+        }
+    }
+}
+
+/// Format a tool's result JSON into a human-readable summary.
+fn format_tool_result(tool_name: &str, result: &serde_json::Value) -> String {
+    // Check for errors first
+    if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+        return format!("[error] {err}");
+    }
+
+    match tool_name {
+        "file_read" => {
+            // Result is typically the file content as a string
+            if let Some(content) = result.as_str() {
+                let lines: Vec<&str> = content.lines().collect();
+                let display_lines = 20;
+                let mut out: Vec<String> = lines
+                    .iter()
+                    .take(display_lines)
+                    .map(|l| l.to_string())
+                    .collect();
+                if lines.len() > display_lines {
+                    out.push(format!("... ({} more lines)", lines.len() - display_lines));
+                }
+                out.join("\n")
+            } else {
+                result.to_string()
+            }
+        }
+        "file_write" => {
+            if let Some(msg) = result.as_str() {
+                msg.to_string()
+            } else {
+                "written".to_string()
+            }
+        }
+        "shell" => {
+            let stdout = result.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+            let exit_code = result.get("exit_code").and_then(|v| v.as_i64());
+            let mut out = String::new();
+            if let Some(code) = exit_code
+                && code != 0
+            {
+                out.push_str(&format!("[exit {}] ", code));
+            }
+            let lines: Vec<&str> = stdout.lines().collect();
+            let display_lines = 20;
+            for line in lines.iter().take(display_lines) {
+                out.push_str(line);
+                out.push('\n');
+            }
+            if lines.len() > display_lines {
+                out.push_str(&format!("... ({} more lines)", lines.len() - display_lines));
+            }
+            out.trim_end().to_string()
+        }
+        "grep" => {
+            if let Some(content) = result.as_str() {
+                let lines: Vec<&str> = content.lines().collect();
+                let display_lines = 20;
+                let mut out: Vec<String> = lines
+                    .iter()
+                    .take(display_lines)
+                    .map(|l| l.to_string())
+                    .collect();
+                if lines.len() > display_lines {
+                    out.push(format!("... ({} more lines)", lines.len() - display_lines));
+                }
+                out.join("\n")
+            } else {
+                result.to_string()
+            }
+        }
+        "ls" => {
+            // Result is typically a JSON array of filenames
+            if let Some(arr) = result.as_array() {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            } else if let Some(s) = result.as_str() {
+                s.to_string()
+            } else {
+                result.to_string()
+            }
+        }
+        _ => {
+            let s = result.to_string();
+            if s.len() > 500 {
+                format!("{}...", &s[..500])
+            } else {
+                s
+            }
+        }
+    }
+}
+
 fn main() {
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -209,12 +357,7 @@ fn run_tui(socket_path: &std::path::Path, workspace: &std::path::Path) {
 
                     // Send result summary to TUI via ToolCallStarted
                     // (repurposed as "tool completed" notification)
-                    let result_str = result.to_string();
-                    let result_summary = if result_str.len() > 500 {
-                        format!("{}...", &result_str[..500])
-                    } else {
-                        result_str
-                    };
+                    let result_summary = format_tool_result(tool_name, &result);
                     let _ = event_tx.send(KernelEvent::ToolCallStarted {
                         session_id: *session_id,
                         tool_name: tool_name.clone(),
@@ -397,15 +540,9 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
         KernelEvent::ExecuteTool {
             tool_name, input, ..
         } => {
-            let input_str = input.to_string();
-            let summary = if input_str.len() > 120 {
-                format!("{}...", &input_str[..120])
-            } else {
-                input_str
-            };
             app.entries.push(tui::ConversationEntry::ToolCall {
                 tool_name: tool_name.clone(),
-                input_summary: summary,
+                input_summary: format_tool_input(tool_name, input),
                 status: tui::ToolCallStatus::Running,
                 result_summary: None,
             });
@@ -541,13 +678,10 @@ fn run_repl(socket_path: &std::path::Path, workspace: &std::path::Path) {
                     input,
                     ..
                 } => {
-                    let input_str = input.to_string();
-                    let display = if input_str.len() > 120 {
-                        format!("{}...", &input_str[..120])
-                    } else {
-                        input_str
-                    };
-                    eprintln!("  [tool] {tool_name}({display})");
+                    eprintln!(
+                        "  [tool] {tool_name}({})",
+                        format_tool_input(&tool_name, &input)
+                    );
 
                     let (result, invalidations) = if let Some(tool) = local_tools_for_reader
                         .iter()
@@ -555,12 +689,7 @@ fn run_repl(socket_path: &std::path::Path, workspace: &std::path::Path) {
                     {
                         match tool.execute(input) {
                             Ok(output) => {
-                                let result_str = output.result.to_string();
-                                let display = if result_str.len() > 200 {
-                                    format!("{}...", &result_str[..200])
-                                } else {
-                                    result_str
-                                };
+                                let display = format_tool_result(&tool_name, &output.result);
                                 eprintln!("  [result] {tool_name} -> {display}");
                                 (output.result, output.invalidations)
                             }

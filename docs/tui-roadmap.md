@@ -1,6 +1,6 @@
 # TUI Roadmap
 
-Current state: ratatui-based TUI in `crates/dist-code-agent/src/tui.rs` with scrollable conversation pane, bordered tool-call boxes with spinners, inline permission prompts (y/n), status bar (model, tokens, turns), and single-line input with cursor editing.
+Current state: ratatui TUI with markdown rendering, input history, multiline input, tool call boxes with spinners and inline results, timestamps, token budget, and theme support.
 
 ## Status key
 
@@ -8,104 +8,77 @@ Current state: ratatui-based TUI in `crates/dist-code-agent/src/tui.rs` with scr
 - [~] In progress
 - [x] Done
 
-## Tier 1: Usability basics
+## Completed
 
-### 1.1 Markdown rendering in assistant output — [x]
-- Render headers, **bold**, `inline code`, and fenced code blocks with syntax highlighting
-- Code blocks are highest priority (coding agent)
-- Options: `tui-markdown` crate, or manual span styling from a lightweight markdown parser
-- Scope: `ConversationEntry::AssistantText` rendering in `draw_conversation`
+- [x] Markdown rendering (pulldown-cmark)
+- [x] Input history (Up/Down)
+- [x] Multiline input (Shift+Enter)
+- [x] Spinner memory leak fix
+- [x] Word-wrap-aware scrolling (unicode-width)
+- [x] Inline tool results
+- [x] Token budget indicator
+- [x] Timestamps
+- [x] Color theme struct
+- [x] Daemon reconnection support
+- [x] Duplicate tool call fix
 
-### 1.2 Input history — [x]
-- Up/Down in input area cycles through previous user inputs
-- Move conversation scroll to Ctrl+Up/Down or Alt+Up/Down
-- Store history in `App` as `Vec<String>` with an index cursor
-- Scope: `handle_key`, `App` state
+## Tool Use Output
 
-### 1.3 Multiline input — [x]
-- Shift+Enter or Alt+Enter inserts a newline
-- Enter submits
-- Input area grows (or scrolls) to accommodate multiple lines
-- Scope: `handle_key`, `draw_input`, input area `Constraint`
+### T1. Human-readable tool input summary — [x]
+- Currently shows raw JSON: `{"path":"src/main.rs","offset":0}`
+- Should show: `path: src/main.rs` (extract key fields per tool)
+- For `file_read`: show path (and line range if offset/limit given)
+- For `shell`: show command
+- For `grep`: show pattern and path
+- For `ls`: show path
+- For `file_write`: show path
+- Scope: format function in main.rs where `input_summary` is built from `input.to_string()`
 
-### 1.4 Fix spinner memory leak — [x]
-- `draw_input` line 420 uses `Box::leak` to work around a lifetime issue
-- Leaks a string allocation every frame (~60/sec if polling)
-- Fix: pre-allocate spinner strings as `&'static str` or restructure to avoid the borrow
-- Scope: `draw_input`
+### T2. Human-readable tool result summary — [x]
+- Currently shows raw JSON string of the result
+- For `file_read`: show the file content directly (it's already text)
+- For `shell`: show stdout, and exit code if non-zero
+- For `grep`: show match lines
+- For `ls`: show file listing
+- For `file_write`: show "wrote N bytes to path"
+- For errors: show error message clearly in red
+- Scope: result formatting in reader thread where `result_summary` is built
 
-## Tier 2: Visual polish
+### T3. Syntax-aware file content in results — [ ]
+- File read results should render with line numbers
+- Optionally detect language from file extension and apply code block styling
+- Reuse the markdown code block style (green) for consistency
+- Scope: `draw_conversation` tool result rendering
 
-### 2.1 Word-wrap-aware scrolling — [x]
-- Scroll calculations don't account for lines that wrap within the viewport
-- `rendered_lines` counts logical lines, not visual lines after wrap
-- Need to compute wrapped line count per entry or use ratatui's line-counting
-- Scope: `draw_conversation`, `App::scroll_up/down`
+### T4. Compact tool call display — [ ]
+- Successful read-only tools (file_read, ls, grep) should be visually compact
+- Collapse result by default when the tool succeeds and the model continues
+- Only expand on failure or when it's the last tool call before assistant text
+- Reduce visual noise during multi-tool turns
+- Scope: `ToolCallStatus` gains a `collapsed: bool`, render logic
 
-### 2.2 Inline tool results — [x]
-- Currently tool results appear as `AssistantText` in the conversation
-- Show results inside the tool call box (collapsed by default)
-- Key or click to expand/collapse
-- Scope: `ConversationEntry::ToolCall` gains a `result: Option<String>`, `draw_conversation`
+### T5. Shell command output styling — [ ]
+- Shell results should look like terminal output (monospace, dim)
+- Show exit code prominently if non-zero
+- Truncate long output with "show more" indicator
+- Stderr should be visually distinct (yellow or red)
+- Scope: tool result rendering, possibly new `ConversationEntry` variant
 
-### 2.3 Token budget indicator — [x]
-- Status bar shows `tokens: 12k in / 3k out` but not the budget
-- Add context utilization: `12k/200k (6%)` or a small progress bar
-- Data available via `QuerySession` → `SessionStatus.utilization`
-- Scope: `draw_status_bar`, periodic `QuerySession` polling in main loop
+### T6. Progress for long-running tools — [ ]
+- Shell commands can take seconds — show elapsed time next to spinner
+- Update the spinner line with `⠋ shell (3.2s)` while running
+- Scope: `ToolCallStatus::Running` gains a start time, render updates
 
-### 2.4 Timestamps — [x]
-- Light timestamps on conversation entries (e.g., `14:32` in dark gray)
-- Useful for long sessions; optional/toggleable
-- Scope: `ConversationEntry` gains a `timestamp: Instant` field, `draw_conversation`
+## General UI
 
-### 2.5 Color theme — [x]
-- Hardcoded colors (Cyan user, Yellow permission, Green success, Red error)
-- At minimum: detect light/dark terminal and adjust
-- Stretch: user-configurable theme via config file
-- Scope: extract colors into a `Theme` struct, pass to draw functions
-
-## Tier 3: Interaction improvements
-
-### 3.1 Copy to clipboard — [ ]
-- Select region in conversation pane, copy to system clipboard
-- Ctrl+Shift+C or platform-native shortcut
-- Requires `clipboard` or `arboard` crate
-- Scope: new selection state in `App`, render highlight, copy action
-
-### 3.2 Search in conversation — [ ]
-- Ctrl+F opens a search bar, highlights matches, n/N to navigate
-- Scope: new `SearchState` in `App`, overlay search bar, highlight spans in `draw_conversation`
-
-### 3.3 Slash commands — [ ]
-- `/clear` — clear conversation display (not context)
+### G1. Slash commands — [ ]
+- `/clear` — clear conversation display
 - `/compact` — send `RequestCompaction` to daemon
-- `/status` — send `QuerySession`, display result
-- `/policy <path>` — load and send `SetPolicy`
+- `/status` — send `QuerySession`, show result inline
 - `/quit` — already exists
-- Scope: `handle_key` Submit path, command parser in main loop
+- Scope: command parser in `InputAction::Submit` path
 
-### 3.4 Permission "always allow" / "always deny" — [ ]
-- Beyond y/n: `a` = always allow this tool, `d` = always deny this tool for the session
-- Sends `SetPolicy` to daemon with updated rules
-- Scope: `handle_key` permission mode, policy mutation in main loop
-
-## Tier 4: Advanced
-
-### 4.1 Split pane file viewer — [ ]
-- When agent reads a file, show contents in a side pane instead of inline
-- Toggle with Ctrl+P or tab
-- Syntax highlighting for code files
-- Scope: new layout variant, file viewer widget, triggered from `ToolCall` results
-
-### 4.2 Session save/resume — [ ]
-- `/save [name]` — persist conversation state to disk
-- `/load [name]` — restore from disk, reconnect to daemon
-- Leverages `ContextStore` trait (durable backend)
-- Scope: serialization of `App.entries`, daemon-side session snapshot
-
-### 4.3 Multiple sessions — [ ]
-- Tab between sessions in the same TUI
-- Each tab is a separate session on the daemon
-- Status bar shows tab indicators
-- Scope: `App` becomes multi-session, tab switching keybinds, per-session state
+### G2. Permission "always allow" — [ ]
+- `a` key during permission prompt = always allow this tool for the session
+- Updates policy via `SetPolicy` message to daemon
+- Scope: `handle_key` permission mode, policy construction
