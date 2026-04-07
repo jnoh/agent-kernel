@@ -57,6 +57,7 @@ fn e2e_simple_text_conversation() {
         usage: Usage {
             input_tokens: 50,
             output_tokens: 30,
+            ..Default::default()
         },
         stop_reason: StopReason::EndTurn,
     }]);

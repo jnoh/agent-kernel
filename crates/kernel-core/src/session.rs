@@ -88,6 +88,32 @@ impl kernel_interfaces::frontend::SessionControl for Session {
 }
 
 impl Session {
+    /// Create a new session directly (used by EventLoop).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: SessionId,
+        mode: SessionMode,
+        workspace: PathBuf,
+        context: ContextManager,
+        permission: PermissionEvaluator,
+        turn_loop: TurnLoop,
+        tools: Vec<Box<dyn ToolRegistration>>,
+        max_tokens: usize,
+    ) -> Self {
+        Self {
+            id,
+            mode,
+            workspace,
+            context,
+            permission,
+            turn_loop,
+            tools,
+            pending_results: Vec::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            max_tokens,
+        }
+    }
+
     /// Run one turn of the agent loop: drain pending results, then execute a turn.
     pub fn run_turn(
         &mut self,
@@ -193,18 +219,16 @@ impl SessionManager {
             config.resource_budget.max_tool_invocations_per_turn,
         );
 
-        let session = Session {
+        let session = Session::new(
             id,
-            mode: config.mode,
-            workspace: config.workspace,
+            config.mode,
+            config.workspace,
             context,
             permission,
             turn_loop,
             tools,
-            pending_results: Vec::new(),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            max_tokens: config.resource_budget.max_tokens_per_session,
-        };
+            config.resource_budget.max_tokens_per_session,
+        );
 
         self.sessions.push(session);
         id
@@ -294,6 +318,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 50,
                     output_tokens: 20,
+                    ..Default::default()
                 },
                 stop_reason: StopReason::EndTurn,
             },

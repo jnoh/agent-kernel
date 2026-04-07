@@ -452,6 +452,18 @@ impl ToolRegistration for GrepTool {
 // Factory
 // ============================================================================
 
+/// Extract a ToolSchema from a ToolRegistration (serializable metadata for the kernel protocol).
+pub fn to_schema(tool: &dyn ToolRegistration) -> kernel_interfaces::protocol::ToolSchema {
+    kernel_interfaces::protocol::ToolSchema {
+        name: tool.name().to_string(),
+        description: tool.description().to_string(),
+        capabilities: tool.capabilities().clone(),
+        schema: tool.schema().clone(),
+        cost: tool.cost(),
+        relevance: tool.relevance().clone(),
+    }
+}
+
 /// Create all distribution tools for the given workspace.
 pub fn create_tools(workspace: &Path) -> Vec<Box<dyn ToolRegistration>> {
     vec![

@@ -1,5 +1,5 @@
 use kernel_interfaces::frontend::FrontendEvents;
-use kernel_interfaces::provider::{ProviderInterface, Response, StopReason};
+use kernel_interfaces::provider::{ProviderInterface, Response, StopReason, Usage};
 use kernel_interfaces::tool::ToolRegistration;
 use kernel_interfaces::types::{CompletionConfig, Content, Decision, TurnId};
 
@@ -20,6 +20,8 @@ pub struct TurnResult {
     pub tool_calls_denied: usize,
     /// Whether the turn was cancelled via the SessionControl cancel flag.
     pub was_cancelled: bool,
+    /// Token usage for this turn.
+    pub usage: Usage,
 }
 
 /// Errors that can occur during a turn.
@@ -179,8 +181,10 @@ impl TurnLoop {
         // Record assistant text response and surface to frontend
         if !text_parts.is_empty() {
             let text = text_parts.join("");
-            frontend.on_text(&text);
-            context.append_assistant_response(text);
+            if !text.trim().is_empty() {
+                frontend.on_text(&text);
+                context.append_assistant_response(text);
+            }
         }
 
         // 4. Dispatch tool calls through permission evaluator
@@ -269,6 +273,7 @@ impl TurnLoop {
             tool_calls_dispatched,
             tool_calls_denied,
             was_cancelled,
+            usage: response.usage,
         })
     }
 }
@@ -299,7 +304,6 @@ mod tests {
     use crate::context::ContextConfig;
     use crate::testutil::*;
     use kernel_interfaces::policy::{Policy, PolicyAction, PolicyRule};
-    use kernel_interfaces::provider::*;
     use kernel_interfaces::tool::ToolRegistration;
     use kernel_interfaces::types::{CompletionConfig, TurnId};
 

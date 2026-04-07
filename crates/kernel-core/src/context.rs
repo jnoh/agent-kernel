@@ -1,3 +1,4 @@
+use crate::context_store::{ContextStore, InMemoryContextStore};
 use kernel_interfaces::tool::ToolRegistration;
 use kernel_interfaces::types::{Content, Invalidation, Message, Prompt, Role};
 use std::collections::HashMap;
@@ -83,7 +84,7 @@ pub struct ContextManager {
     scratchpad: Scratchpad,
 
     // Tier 2: Short-Term Memory (managed, evictable)
-    turns: Vec<Turn>,
+    store: Box<dyn ContextStore>,
 
     // File content cache (evictable, re-readable from disk)
     file_cache: HashMap<PathBuf, String>,
@@ -102,12 +103,19 @@ pub struct ContextManager {
 
 impl ContextManager {
     pub fn new(config: ContextConfig, system_prompt: String) -> Self {
+        Self::with_store(config, system_prompt, Box::new(InMemoryContextStore::new()))
+    }
+
+    /// Create a context manager with a custom storage backend.
+    pub fn with_store(
+        config: ContextConfig,
+        system_prompt: String,
+        store: Box<dyn ContextStore>,
+    ) -> Self {
         let system_prompt_tokens = estimate_tokens(&system_prompt);
         let max_system = (config.context_window as f64 * config.system_prompt_budget) as usize;
 
         if system_prompt_tokens > max_system {
-            // Log warning — system prompt exceeds budget cap.
-            // In production this would surface to the frontend.
             eprintln!(
                 "warning: system prompt ({} tokens) exceeds budget cap ({} tokens)",
                 system_prompt_tokens, max_system
@@ -118,7 +126,7 @@ impl ContextManager {
             config,
             system_prompt,
             scratchpad: Scratchpad::default(),
-            turns: Vec::new(),
+            store,
             file_cache: HashMap::new(),
             tool_definitions_in_context: Vec::new(),
             tool_names_in_context: Vec::new(),
@@ -159,13 +167,13 @@ impl ContextManager {
 
     /// Number of turns in history.
     pub fn turn_count(&self) -> usize {
-        self.turns.len()
+        self.store.turn_count()
     }
 
     /// Append a user input as a new turn.
     pub fn append_user_input(&mut self, text: String) {
         let tokens = estimate_tokens(&text);
-        self.turns.push(Turn {
+        self.store.append_turn(Turn {
             input: Message {
                 role: Role::User,
                 content: vec![Content::Text(text)],
@@ -181,7 +189,7 @@ impl ContextManager {
     /// Record the assistant's response for the current turn.
     pub fn append_assistant_response(&mut self, text: String) {
         let tokens = estimate_tokens(&text);
-        if let Some(turn) = self.turns.last_mut() {
+        if let Some(turn) = self.store.last_turn_mut() {
             turn.response = Some(Message {
                 role: Role::Assistant,
                 content: vec![Content::Text(text)],
@@ -199,7 +207,7 @@ impl ContextManager {
         result: serde_json::Value,
     ) {
         let tokens = estimate_tokens(&input.to_string()) + estimate_tokens(&result.to_string());
-        if let Some(turn) = self.turns.last_mut() {
+        if let Some(turn) = self.store.last_turn_mut() {
             turn.tool_exchanges.push(ToolExchange {
                 tool_name,
                 input,
@@ -214,7 +222,7 @@ impl ContextManager {
     /// Append a system message (e.g., from child session completion or external event).
     pub fn append_system_message(&mut self, text: String) {
         let tokens = estimate_tokens(&text);
-        self.turns.push(Turn {
+        self.store.append_turn(Turn {
             input: Message {
                 role: Role::System,
                 content: vec![Content::Text(text)],
@@ -313,27 +321,36 @@ impl ContextManager {
 
         // Build messages from turns (Tier 2)
         let messages: Vec<Message> = self
-            .turns
+            .store
+            .turns()
             .iter()
             .flat_map(|turn| {
                 let mut msgs = vec![turn.input.clone()];
 
                 // Include tool calls and results so the model sees the full exchange
                 if !turn.tool_exchanges.is_empty() {
-                    // Assistant message with tool calls
-                    let tool_call_content: Vec<Content> = turn
-                        .tool_exchanges
-                        .iter()
-                        .enumerate()
-                        .map(|(i, ex)| Content::ToolCall {
+                    // Assistant message: include response text (if any) alongside tool calls,
+                    // since the model originally produced them in one response.
+                    let mut assistant_content: Vec<Content> = Vec::new();
+                    if let Some(ref response) = turn.response {
+                        for c in &response.content {
+                            if let Content::Text(t) = c
+                                && !t.trim().is_empty()
+                            {
+                                assistant_content.push(Content::Text(t.clone()));
+                            }
+                        }
+                    }
+                    assistant_content.extend(turn.tool_exchanges.iter().enumerate().map(
+                        |(i, ex)| Content::ToolCall {
                             id: format!("call_{i}"),
                             name: ex.tool_name.clone(),
                             input: ex.input.clone(),
-                        })
-                        .collect();
+                        },
+                    ));
                     msgs.push(Message {
                         role: Role::Assistant,
-                        content: tool_call_content,
+                        content: assistant_content,
                     });
 
                     // Tool results
@@ -350,9 +367,8 @@ impl ContextManager {
                         role: Role::User,
                         content: tool_result_content,
                     });
-                }
-
-                if let Some(ref response) = turn.response {
+                } else if let Some(ref response) = turn.response {
+                    // Text-only response (no tool calls)
                     msgs.push(response.clone());
                 }
                 msgs
@@ -384,7 +400,7 @@ impl ContextManager {
             ));
         }
 
-        let total_turns = self.turns.len();
+        let total_turns = self.store.turn_count();
         if total_turns < 2 {
             self.consecutive_compaction_failures += 1;
             return Err("not enough turns to compact".into());
@@ -403,7 +419,7 @@ impl ContextManager {
         let mut tokens_freed = 0;
 
         // Summarize turns in the compaction zone that haven't been summarized yet
-        for turn in &mut self.turns[..compact_up_to] {
+        for turn in &mut self.store.turns_mut()[..compact_up_to] {
             if !turn.summarized {
                 let original_tokens = turn.token_estimate;
 
@@ -507,7 +523,7 @@ mod tests {
             serde_json::json!({"path": "."}),
             serde_json::json!({"files": ["a.rs", "b.rs"]}),
         );
-        assert_eq!(cm.turns.last().unwrap().tool_exchanges.len(), 1);
+        assert_eq!(cm.store.turns().last().unwrap().tool_exchanges.len(), 1);
     }
 
     #[test]
@@ -577,7 +593,7 @@ mod tests {
 
         // Last ~30% of turns should NOT be summarized
         let tail_count = (10.0_f64 * 0.30).ceil() as usize; // 3
-        for turn in &cm.turns[cm.turns.len() - tail_count..] {
+        for turn in &cm.store.turns()[cm.store.turn_count() - tail_count..] {
             assert!(!turn.summarized, "tail turns should not be summarized");
         }
     }

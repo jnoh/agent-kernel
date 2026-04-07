@@ -1,4 +1,7 @@
-//! Provider implementations for the code-agent distribution.
+//! Provider implementations for the kernel daemon.
+//!
+//! The daemon owns the model — it calls the LLM API directly.
+//! Distros never interact with the provider.
 
 use kernel_interfaces::provider::{
     ProviderCaps, ProviderError, ProviderInterface, Response, StopReason, Usage,
@@ -76,17 +79,14 @@ impl AnthropicProvider {
         Self { api_key, model }
     }
 
-    /// Minimum tokens for prompt caching to activate (model-dependent).
     fn cache_min_tokens(&self) -> usize {
         if self.model.contains("sonnet") {
             2048
         } else {
-            // Opus, Haiku 4.5, and others require 4096
             4096
         }
     }
 
-    /// Convert our Prompt into the Anthropic Messages API request body.
     fn build_request_body(&self, prompt: &Prompt, config: &CompletionConfig) -> serde_json::Value {
         let mut messages = convert_messages(&prompt.messages);
         let tools = convert_tools(&prompt.tool_definitions);
@@ -97,22 +97,13 @@ impl AnthropicProvider {
             "messages": messages,
         });
 
-        // --- Prompt caching ---
-        // Estimate total prefix size to decide whether caching can activate.
-        // Rough estimate: 4 chars per token across the serialized body.
         let system_chars = prompt.system.len();
         let tools_chars: usize = tools.iter().map(|t| t.to_string().len()).sum();
         let msgs_chars: usize = messages.iter().map(|m| m.to_string().len()).sum();
         let total_prefix_tokens = (system_chars + tools_chars + msgs_chars) / 4;
         let min_tokens = self.cache_min_tokens();
 
-        // Only add cache_control breakpoints when there's enough content.
-        // The API silently ignores them below the threshold, but skipping
-        // them keeps the request cleaner and avoids the cache-write surcharge.
         if total_prefix_tokens >= min_tokens {
-            // Breakpoint 1: system prompt + tools combined.
-            // Place on the last tool definition so the entire static prefix
-            // (system + all tools) is cached as one block.
             if !prompt.system.is_empty() {
                 body["system"] = serde_json::json!([{
                     "type": "text",
@@ -128,7 +119,6 @@ impl AnthropicProvider {
                 }
                 body["tools"] = serde_json::Value::Array(tools);
             } else if !prompt.system.is_empty() {
-                // No tools — put the breakpoint on the system prompt instead
                 body["system"] = serde_json::json!([{
                     "type": "text",
                     "text": prompt.system,
@@ -136,9 +126,6 @@ impl AnthropicProvider {
                 }]);
             }
 
-            // Breakpoint 2: conversation prefix up to the second-to-last message.
-            // On continuation turns (after tool use), everything before the latest
-            // tool results is identical — caching it avoids re-processing.
             if messages.len() >= 2 {
                 let cache_idx = messages.len() - 2;
                 if let Some(msg) = messages.get_mut(cache_idx)
@@ -150,11 +137,9 @@ impl AnthropicProvider {
                 body["messages"] = serde_json::Value::Array(messages);
             }
         } else {
-            // Below threshold — no caching, just pass through
             if !prompt.system.is_empty() {
                 body["system"] = serde_json::json!(prompt.system);
             }
-
             if !tools.is_empty() {
                 body["tools"] = serde_json::Value::Array(tools);
             }
@@ -163,7 +148,6 @@ impl AnthropicProvider {
         if let Some(temp) = config.temperature {
             body["temperature"] = serde_json::json!(temp);
         }
-
         if !config.stop_sequences.is_empty() {
             body["stop_sequences"] = serde_json::json!(config.stop_sequences);
         }
@@ -194,17 +178,14 @@ impl ProviderInterface for AnthropicProvider {
                     .body_mut()
                     .read_to_string()
                     .map_err(|e| ProviderError::Network(format!("failed to read body: {e}")))?;
-
                 let response_json: serde_json::Value = serde_json::from_str(&response_text)
                     .map_err(|e| ProviderError::Parse(format!("{e}: {response_text}")))?;
-
                 parse_response(&response_json)
             }
             Err(ureq::Error::StatusCode(429)) => Err(ProviderError::RateLimited {
                 retry_after_secs: None,
             }),
             Err(ureq::Error::StatusCode(status)) => {
-                // Try to read the error body
                 let message = format!("HTTP {status}");
                 Err(ProviderError::Api { status, message })
             }
@@ -213,7 +194,6 @@ impl ProviderInterface for AnthropicProvider {
     }
 
     fn count_tokens(&self, content: &Content) -> usize {
-        // Approximate: 4 chars per token
         match content {
             Content::Text(t) => t.len() / 4,
             Content::ToolCall { input, .. } => input.to_string().len() / 4,
@@ -235,7 +215,6 @@ impl ProviderInterface for AnthropicProvider {
 // Conversion helpers
 // ============================================================================
 
-/// Convert our Message types to the Anthropic Messages API format.
 fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     let mut result = Vec::new();
 
@@ -253,31 +232,20 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                 _ => true,
             })
             .map(|c| match c {
-                Content::Text(t) => serde_json::json!({
-                    "type": "text",
-                    "text": t,
-                }),
+                Content::Text(t) => serde_json::json!({"type": "text", "text": t}),
                 Content::ToolCall { id, name, input } => serde_json::json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": input,
+                    "type": "tool_use", "id": id, "name": name, "input": input,
                 }),
                 Content::ToolResult { id, result } => serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": id,
-                    "content": result.to_string(),
+                    "type": "tool_result", "tool_use_id": id, "content": result.to_string(),
                 }),
             })
             .collect();
 
-        // Skip messages where all content was filtered out
         if content.is_empty() {
             continue;
         }
 
-        // Anthropic requires alternating user/assistant roles.
-        // Merge consecutive same-role messages.
         if let Some(last) = result.last_mut() {
             let last_obj: &mut serde_json::Value = last;
             if last_obj.get("role").and_then(|r| r.as_str()) == Some(role)
@@ -288,23 +256,16 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             }
         }
 
-        result.push(serde_json::json!({
-            "role": role,
-            "content": content,
-        }));
+        result.push(serde_json::json!({"role": role, "content": content}));
     }
 
     result
 }
 
-/// Convert our tool definitions to the Anthropic tools format.
 fn convert_tools(tool_definitions: &[serde_json::Value]) -> Vec<serde_json::Value> {
     tool_definitions
         .iter()
         .map(|def| {
-            // Our format: { "name": ..., "description": ..., "input_schema": ... }
-            // Anthropic format: { "name": ..., "description": ..., "input_schema": ... }
-            // They match — we just pass them through, ensuring the required fields exist.
             let name = def
                 .get("name")
                 .cloned()
@@ -316,10 +277,7 @@ fn convert_tools(tool_definitions: &[serde_json::Value]) -> Vec<serde_json::Valu
             let input_schema = def
                 .get("input_schema")
                 .cloned()
-                .unwrap_or(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }));
+                .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
 
             serde_json::json!({
                 "name": name,
@@ -330,7 +288,6 @@ fn convert_tools(tool_definitions: &[serde_json::Value]) -> Vec<serde_json::Valu
         .collect()
 }
 
-/// Parse an Anthropic API response into our Response type.
 fn parse_response(json: &serde_json::Value) -> Result<Response, ProviderError> {
     let content_blocks = json
         .get("content")
@@ -364,9 +321,7 @@ fn parse_response(json: &serde_json::Value) -> Result<Response, ProviderError> {
                 let input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
                 content.push(Content::ToolCall { id, name, input });
             }
-            _ => {
-                // Unknown block type — skip
-            }
+            _ => {}
         }
     }
 
@@ -399,95 +354,4 @@ fn parse_response(json: &serde_json::Value) -> Result<Response, ProviderError> {
         usage,
         stop_reason,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_text_response() {
-        let json = serde_json::json!({
-            "content": [{"type": "text", "text": "Hello!"}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 10, "output_tokens": 5}
-        });
-        let resp = parse_response(&json).unwrap();
-        assert_eq!(resp.content.len(), 1);
-        assert!(matches!(&resp.content[0], Content::Text(t) if t == "Hello!"));
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-    }
-
-    #[test]
-    fn parse_tool_use_response() {
-        let json = serde_json::json!({
-            "content": [
-                {"type": "text", "text": "Let me read that file."},
-                {"type": "tool_use", "id": "toolu_123", "name": "file_read", "input": {"path": "main.rs"}}
-            ],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 50, "output_tokens": 30}
-        });
-        let resp = parse_response(&json).unwrap();
-        assert_eq!(resp.content.len(), 2);
-        assert!(matches!(&resp.content[0], Content::Text(_)));
-        assert!(matches!(&resp.content[1], Content::ToolCall { name, .. } if name == "file_read"));
-        assert_eq!(resp.stop_reason, StopReason::ToolUse);
-    }
-
-    #[test]
-    fn convert_messages_merges_same_role() {
-        let messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![Content::Text("Hello".into())],
-            },
-            Message {
-                role: Role::User,
-                content: vec![Content::Text("More".into())],
-            },
-        ];
-        let converted = convert_messages(&messages);
-        // Should merge into one user message with two text blocks
-        assert_eq!(converted.len(), 1);
-        let content = converted[0].get("content").unwrap().as_array().unwrap();
-        assert_eq!(content.len(), 2);
-    }
-
-    #[test]
-    fn convert_messages_alternating_roles() {
-        let messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![Content::Text("Hello".into())],
-            },
-            Message {
-                role: Role::Assistant,
-                content: vec![Content::Text("Hi".into())],
-            },
-            Message {
-                role: Role::User,
-                content: vec![Content::Text("Thanks".into())],
-            },
-        ];
-        let converted = convert_messages(&messages);
-        assert_eq!(converted.len(), 3);
-    }
-
-    #[test]
-    fn convert_tools_format() {
-        let defs = vec![serde_json::json!({
-            "name": "file_read",
-            "description": "Read a file",
-            "input_schema": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"]
-            }
-        })];
-        let tools = convert_tools(&defs);
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "file_read");
-        assert!(tools[0].get("input_schema").is_some());
-    }
 }

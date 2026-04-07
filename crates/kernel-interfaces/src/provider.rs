@@ -54,6 +54,10 @@ pub struct Response {
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// Tokens written to the prompt cache this request.
+    pub cache_creation_input_tokens: usize,
+    /// Tokens read from the prompt cache this request (90% cheaper).
+    pub cache_read_input_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,9 +1,10 @@
 use crate::tool::ToolOutput;
 use crate::types::{Decision, StreamChunk, TurnId};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Summary of a compaction event, for frontend display.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionSummary {
     pub turns_before: usize,
     pub turns_after: usize,
@@ -11,7 +12,7 @@ pub struct CompactionSummary {
 }
 
 /// Permission request that the frontend must resolve.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionRequest {
     pub tool_name: String,
     pub capabilities: Vec<String>,
@@ -19,7 +20,7 @@ pub struct PermissionRequest {
 }
 
 /// Errors from kernel operations surfaced to the frontend.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelError {
     pub message: String,
     pub recoverable: bool,

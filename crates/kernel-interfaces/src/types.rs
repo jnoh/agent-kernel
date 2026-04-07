@@ -68,7 +68,7 @@ pub enum Invalidation {
 }
 
 /// The result of a permission evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     Allow,
     Deny(String),
@@ -76,7 +76,7 @@ pub enum Decision {
 }
 
 /// How a session operates — interactive (human attached) or autonomous (policy-driven).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionMode {
     Interactive,
     Autonomous,
@@ -120,7 +120,7 @@ pub struct Prompt {
 }
 
 /// Configuration for a completion request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionConfig {
     pub max_tokens: usize,
     pub temperature: Option<f64>,

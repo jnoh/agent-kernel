@@ -341,6 +341,7 @@ pub fn text_response(text: &str) -> Response {
         usage: Usage {
             input_tokens: 100,
             output_tokens: 50,
+            ..Default::default()
         },
         stop_reason: StopReason::EndTurn,
     }
@@ -357,6 +358,7 @@ pub fn tool_call_response(tool_name: &str, input: serde_json::Value) -> Response
         usage: Usage {
             input_tokens: 100,
             output_tokens: 50,
+            ..Default::default()
         },
         stop_reason: StopReason::ToolUse,
     }
