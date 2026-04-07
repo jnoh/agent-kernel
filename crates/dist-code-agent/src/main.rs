@@ -75,17 +75,23 @@ fn format_tool_result(tool_name: &str, result: &serde_json::Value) -> String {
 
     match tool_name {
         "file_read" => {
-            // Result is typically the file content as a string
             if let Some(content) = result.as_str() {
                 let lines: Vec<&str> = content.lines().collect();
                 let display_lines = 20;
+                let total = lines.len();
+                let width = total.to_string().len().max(2);
                 let mut out: Vec<String> = lines
                     .iter()
+                    .enumerate()
                     .take(display_lines)
-                    .map(|l| l.to_string())
+                    .map(|(i, l)| format!("{:>width$} │ {l}", i + 1))
                     .collect();
-                if lines.len() > display_lines {
-                    out.push(format!("... ({} more lines)", lines.len() - display_lines));
+                if total > display_lines {
+                    out.push(format!(
+                        "{:>width$}   ... ({} more lines)",
+                        "",
+                        total - display_lines
+                    ));
                 }
                 out.join("\n")
             } else {
@@ -543,8 +549,9 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             app.entries.push(tui::ConversationEntry::ToolCall {
                 tool_name: tool_name.clone(),
                 input_summary: format_tool_input(tool_name, input),
-                status: tui::ToolCallStatus::Running,
+                status: tui::ToolCallStatus::Running(std::time::Instant::now()),
                 result_summary: None,
+                collapsed: false,
             });
             app.scroll_to_bottom();
         }
@@ -563,7 +570,7 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
                         ..
                     } = entry
                         && n == tool_name
-                        && *status == tui::ToolCallStatus::Running
+                        && matches!(status, tui::ToolCallStatus::Running(_))
                     {
                         *status = tui::ToolCallStatus::Success;
                         *result_summary = Some(result_str.to_string());
@@ -609,9 +616,36 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             // Mark any remaining Running tool calls as Success
             for entry in &mut app.entries {
                 if let tui::ConversationEntry::ToolCall { status, .. } = entry
-                    && *status == tui::ToolCallStatus::Running
+                    && matches!(status, tui::ToolCallStatus::Running(_))
                 {
                     *status = tui::ToolCallStatus::Success;
+                }
+            }
+
+            // Auto-collapse successful tool calls except the last one,
+            // to reduce visual noise in multi-tool turns.
+            let mut last_tool_idx = None;
+            for (i, entry) in app.entries.iter().enumerate().rev() {
+                if matches!(
+                    entry,
+                    tui::ConversationEntry::ToolCall {
+                        status: tui::ToolCallStatus::Success,
+                        ..
+                    }
+                ) {
+                    last_tool_idx = Some(i);
+                    break;
+                }
+            }
+            for (i, entry) in app.entries.iter_mut().enumerate() {
+                if let tui::ConversationEntry::ToolCall {
+                    status: tui::ToolCallStatus::Success,
+                    collapsed,
+                    ..
+                } = entry
+                    && Some(i) != last_tool_idx
+                {
+                    *collapsed = true;
                 }
             }
         }

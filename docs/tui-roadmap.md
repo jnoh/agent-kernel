@@ -44,27 +44,27 @@ Current state: ratatui TUI with markdown rendering, input history, multiline inp
 - For errors: show error message clearly in red
 - Scope: result formatting in reader thread where `result_summary` is built
 
-### T3. Syntax-aware file content in results — [ ]
+### T3. Syntax-aware file content in results — [x]
 - File read results should render with line numbers
 - Optionally detect language from file extension and apply code block styling
 - Reuse the markdown code block style (green) for consistency
 - Scope: `draw_conversation` tool result rendering
 
-### T4. Compact tool call display — [ ]
+### T4. Compact tool call display — [x]
 - Successful read-only tools (file_read, ls, grep) should be visually compact
 - Collapse result by default when the tool succeeds and the model continues
 - Only expand on failure or when it's the last tool call before assistant text
 - Reduce visual noise during multi-tool turns
 - Scope: `ToolCallStatus` gains a `collapsed: bool`, render logic
 
-### T5. Shell command output styling — [ ]
+### T5. Shell command output styling — [x]
 - Shell results should look like terminal output (monospace, dim)
 - Show exit code prominently if non-zero
 - Truncate long output with "show more" indicator
 - Stderr should be visually distinct (yellow or red)
 - Scope: tool result rendering, possibly new `ConversationEntry` variant
 
-### T6. Progress for long-running tools — [ ]
+### T6. Progress for long-running tools — [x]
 - Shell commands can take seconds — show elapsed time next to spinner
 - Update the spinner line with `⠋ shell (3.2s)` while running
 - Scope: `ToolCallStatus::Running` gains a start time, render updates

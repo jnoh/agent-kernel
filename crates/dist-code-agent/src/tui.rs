@@ -104,6 +104,8 @@ pub enum ConversationEntry {
         status: ToolCallStatus,
         /// Tool result (populated after execution).
         result_summary: Option<String>,
+        /// Whether to show compact (single-line) or expanded (box) view.
+        collapsed: bool,
     },
     /// Permission request awaiting user decision.
     PermissionPrompt {
@@ -117,10 +119,10 @@ pub enum ConversationEntry {
     Error(String),
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 #[allow(dead_code)]
 pub enum ToolCallStatus {
-    Running,
+    Running(std::time::Instant),
     Success,
     Failed(String),
 }
@@ -460,15 +462,46 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                 input_summary,
                 status,
                 result_summary,
+                collapsed,
             } => {
                 lines.push(Line::from(""));
+
+                // Compact single-line view for collapsed tool calls
+                if *collapsed {
+                    let (indicator, style) = match status {
+                        ToolCallStatus::Success => {
+                            ("\u{2713}", Style::default().fg(app.theme.tool_success))
+                        }
+                        ToolCallStatus::Failed(_) => {
+                            ("\u{2717}", Style::default().fg(app.theme.tool_failed))
+                        }
+                        _ => ("", Style::default()),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {indicator} "), style),
+                        Span::styled(
+                            tool_name.clone(),
+                            Style::default()
+                                .fg(app.theme.tool_border)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" {input_summary}"),
+                            Style::default().fg(app.theme.info),
+                        ),
+                    ]));
+                    continue;
+                }
                 let (indicator, style) = match status {
-                    ToolCallStatus::Running => {
+                    ToolCallStatus::Running(start) => {
                         let ch = SPINNER[app.spinner_tick % SPINNER.len()];
-                        (
-                            format!(" {ch}"),
-                            Style::default().fg(app.theme.tool_running),
-                        )
+                        let elapsed = start.elapsed().as_secs_f32();
+                        let time_str = if elapsed >= 1.0 {
+                            format!(" {ch} {elapsed:.1}s")
+                        } else {
+                            format!(" {ch}")
+                        };
+                        (time_str, Style::default().fg(app.theme.tool_running))
                     }
                     ToolCallStatus::Success => (
                         " \u{2713}".to_string(),
@@ -509,7 +542,19 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 // Result lines (inside the box, truncated)
                 if let Some(result) = result_summary {
-                    let max_result_lines = 6;
+                    let max_result_lines = 10;
+                    let result_color = match tool_name.as_str() {
+                        "file_read" | "grep" => app.theme.code_block,
+                        "shell" => Color::White,
+                        _ => app.theme.tool_result,
+                    };
+                    // Show error results in red
+                    let result_color =
+                        if result.starts_with("[error]") || result.starts_with("[exit") {
+                            app.theme.error
+                        } else {
+                            result_color
+                        };
                     let result_lines: Vec<&str> = result.lines().collect();
                     let truncated = result_lines.len() > max_result_lines;
                     for line in result_lines.iter().take(max_result_lines) {
@@ -521,23 +566,23 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                         lines.push(Line::from(vec![
                             Span::styled(
                                 "\u{2502} ".to_string(),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(app.theme.tool_border),
                             ),
-                            Span::styled(content, Style::default().fg(Color::DarkGray)),
+                            Span::styled(content, Style::default().fg(result_color)),
                         ]));
                     }
                     if truncated {
                         lines.push(Line::from(vec![
                             Span::styled(
                                 "\u{2502} ".to_string(),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(app.theme.tool_border),
                             ),
                             Span::styled(
                                 format!(
                                     "... ({} more lines)",
                                     result_lines.len() - max_result_lines
                                 ),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(app.theme.info),
                             ),
                         ]));
                     }
