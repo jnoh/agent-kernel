@@ -52,11 +52,17 @@ impl ConnectionRouter {
     pub fn handle_request(&mut self, request: KernelRequest) -> bool {
         match request {
             KernelRequest::RegisterTools { tools } => {
+                eprintln!("  registered {} tools", tools.len());
                 self.tool_schemas = tools;
             }
 
             KernelRequest::CreateSession { config } => {
                 let session_id = SessionId(self.next_session_id);
+                eprintln!(
+                    "  creating session {:?} with {} tools",
+                    session_id,
+                    self.tool_schemas.len()
+                );
                 self.next_session_id += 1;
 
                 // Create per-session channels
@@ -129,9 +135,16 @@ impl ConnectionRouter {
 
             KernelRequest::AddInput { session_id, text } => {
                 if let Some(entry) = self.sessions.get(&session_id) {
+                    eprintln!("  routing AddInput to session {:?}", session_id);
                     let _ = entry
                         .input_tx
                         .send(KernelRequest::AddInput { session_id, text });
+                } else {
+                    eprintln!(
+                        "  AddInput: session {:?} not found (have: {:?})",
+                        session_id,
+                        self.sessions.keys().collect::<Vec<_>>()
+                    );
                 }
             }
 
