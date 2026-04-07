@@ -1058,5 +1058,28 @@ fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
     // Flush any remaining spans
     flush_line(&mut current_spans, &mut lines);
 
+    // Collapse consecutive blank lines into single blank lines
+    let is_blank =
+        |l: &Line<'_>| l.spans.is_empty() || l.spans.iter().all(|s| s.content.is_empty());
+    let mut deduped = Vec::with_capacity(lines.len());
+    let mut prev_blank = false;
+    for line in lines {
+        let blank = is_blank(&line);
+        if blank && prev_blank {
+            continue;
+        }
+        prev_blank = blank;
+        deduped.push(line);
+    }
+    let mut lines = deduped;
+
+    // Strip leading and trailing empty lines — the caller handles entry spacing
+    while lines.first().is_some_and(&is_blank) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(&is_blank) {
+        lines.pop();
+    }
+
     lines
 }
