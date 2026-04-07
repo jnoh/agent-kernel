@@ -147,6 +147,8 @@ pub struct App {
     pub follow: bool,
     /// Total rendered lines in the conversation (computed each frame).
     rendered_lines: u16,
+    /// Viewport height of the conversation pane (computed each frame).
+    viewport_height: u16,
 
     // --- Status bar fields ---
     pub model_name: String,
@@ -187,6 +189,7 @@ impl App {
             scroll: 0,
             follow: true,
             rendered_lines: 0,
+            viewport_height: 20,
             model_name: "anthropic".into(),
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -684,6 +687,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     app.rendered_lines = total_visual_lines;
 
     let viewport_height = area.height;
+    app.viewport_height = viewport_height;
     if app.follow {
         app.scroll = total_visual_lines.saturating_sub(viewport_height);
     }
@@ -875,7 +879,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_down(3, 20);
+            let vh = app.viewport_height;
+            app.scroll_down(3, vh);
             InputAction::None
         }
         KeyCode::Up => {
@@ -887,11 +892,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
         KeyCode::PageUp => {
-            app.scroll_up(20);
+            let vh = app.viewport_height;
+            app.scroll_up(vh);
             InputAction::None
         }
         KeyCode::PageDown => {
-            app.scroll_down(20, 20);
+            let vh = app.viewport_height;
+            app.scroll_down(vh, vh);
             InputAction::None
         }
         _ => InputAction::None,
