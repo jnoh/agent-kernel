@@ -618,12 +618,17 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Compute visual line count accounting for word wrap.
-    // Each logical line wraps to ceil(width / viewport_width) visual rows.
+    // Use unicode display width to match ratatui's wrapping behavior.
+    use unicode_width::UnicodeWidthStr;
     let viewport_width = area.width.max(1) as usize;
     let total_visual_lines: u16 = lines
         .iter()
         .map(|line| {
-            let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            let line_width: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
             if line_width == 0 {
                 1
             } else {

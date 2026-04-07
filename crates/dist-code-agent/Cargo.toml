@@ -15,6 +15,7 @@ serde_yaml = "0.9"
 ratatui = "0.29"
 crossterm = "0.28"
 pulldown-cmark = "0.13"
+unicode-width = "0.1"
 
 [dev-dependencies]
 kernel-core = { path = "../kernel-core" }
