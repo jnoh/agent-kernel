@@ -36,30 +36,30 @@ Current state: ratatui-based TUI in `crates/dist-code-agent/src/tui.rs` with scr
 
 ## Tier 2: Visual polish
 
-### 2.1 Word-wrap-aware scrolling — [ ]
+### 2.1 Word-wrap-aware scrolling — [x]
 - Scroll calculations don't account for lines that wrap within the viewport
 - `rendered_lines` counts logical lines, not visual lines after wrap
 - Need to compute wrapped line count per entry or use ratatui's line-counting
 - Scope: `draw_conversation`, `App::scroll_up/down`
 
-### 2.2 Inline tool results — [ ]
+### 2.2 Inline tool results — [x]
 - Currently tool results appear as `AssistantText` in the conversation
 - Show results inside the tool call box (collapsed by default)
 - Key or click to expand/collapse
 - Scope: `ConversationEntry::ToolCall` gains a `result: Option<String>`, `draw_conversation`
 
-### 2.3 Token budget indicator — [ ]
+### 2.3 Token budget indicator — [x]
 - Status bar shows `tokens: 12k in / 3k out` but not the budget
 - Add context utilization: `12k/200k (6%)` or a small progress bar
 - Data available via `QuerySession` → `SessionStatus.utilization`
 - Scope: `draw_status_bar`, periodic `QuerySession` polling in main loop
 
-### 2.4 Timestamps — [ ]
+### 2.4 Timestamps — [x]
 - Light timestamps on conversation entries (e.g., `14:32` in dark gray)
 - Useful for long sessions; optional/toggleable
 - Scope: `ConversationEntry` gains a `timestamp: Instant` field, `draw_conversation`
 
-### 2.5 Color theme — [ ]
+### 2.5 Color theme — [x]
 - Hardcoded colors (Cyan user, Yellow permission, Green success, Red error)
 - At minimum: detect light/dark terminal and adjust
 - Stretch: user-configurable theme via config file

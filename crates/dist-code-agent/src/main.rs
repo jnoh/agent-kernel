@@ -187,9 +187,9 @@ fn run_tui(socket_path: &std::path::Path, workspace: &std::path::Path) {
                     request_id,
                     tool_name,
                     input,
-                    ..
+                    session_id,
                 } => {
-                    // Forward ToolCallStarted-equivalent to TUI
+                    // Forward to TUI to show Running entry
                     let _ = event_tx.send(kernel_event.clone());
 
                     let (result, invalidations) = if let Some(tool) = local_tools_for_reader
@@ -206,6 +206,20 @@ fn run_tui(socket_path: &std::path::Path, workspace: &std::path::Path) {
                             vec![],
                         )
                     };
+
+                    // Send result summary to TUI via ToolCallStarted
+                    // (repurposed as "tool completed" notification)
+                    let result_str = result.to_string();
+                    let result_summary = if result_str.len() > 500 {
+                        format!("{}...", &result_str[..500])
+                    } else {
+                        result_str
+                    };
+                    let _ = event_tx.send(KernelEvent::ToolCallStarted {
+                        session_id: *session_id,
+                        tool_name: tool_name.clone(),
+                        input: serde_json::json!({ "__result": result_summary }),
+                    });
 
                     let mut w = writer_for_reader.lock().unwrap();
                     let _ = write_message(
@@ -275,8 +289,10 @@ fn run_tui_loop(
         {
             match tui::handle_key(app, key) {
                 tui::InputAction::Submit(text) => {
-                    app.entries
-                        .push(tui::ConversationEntry::UserInput(text.clone()));
+                    app.entries.push(tui::ConversationEntry::UserInput(
+                        text.clone(),
+                        std::time::SystemTime::now(),
+                    ));
                     app.scroll_to_bottom();
                     app.turn_active = true;
 
@@ -329,8 +345,23 @@ fn run_tui_loop(
         }
 
         // Drain kernel events
+        let mut turn_ended = false;
         while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, KernelEvent::TurnEnded { .. }) {
+                turn_ended = true;
+            }
             apply_event(app, &ev);
+        }
+
+        // Query session status after a turn completes to update context usage
+        if turn_ended {
+            let mut w = writer.lock().unwrap();
+            let _ = write_message(
+                &mut *w,
+                &KernelRequest::QuerySession {
+                    session_id: kernel_interfaces::types::SessionId(0),
+                },
+            );
         }
 
         // Advance spinner
@@ -350,12 +381,15 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
 
         KernelEvent::TextOutput { text, .. } => {
             // Merge consecutive assistant text entries
-            if let Some(tui::ConversationEntry::AssistantText(existing)) = app.entries.last_mut() {
+            if let Some(tui::ConversationEntry::AssistantText(existing, _)) = app.entries.last_mut()
+            {
                 existing.push('\n');
                 existing.push_str(text);
             } else {
-                app.entries
-                    .push(tui::ConversationEntry::AssistantText(text.clone()));
+                app.entries.push(tui::ConversationEntry::AssistantText(
+                    text.clone(),
+                    std::time::SystemTime::now(),
+                ));
             }
             app.scroll_to_bottom();
         }
@@ -373,6 +407,7 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
                 tool_name: tool_name.clone(),
                 input_summary: summary,
                 status: tui::ToolCallStatus::Running,
+                result_summary: None,
             });
             app.scroll_to_bottom();
         }
@@ -380,7 +415,29 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
         KernelEvent::ToolCallStarted {
             tool_name, input, ..
         } => {
-            // Update existing Running entry to show it started, or add one
+            // Check if this is a result notification (from our reader thread)
+            if let Some(result_str) = input.get("__result").and_then(|v| v.as_str()) {
+                // Find the matching Running entry and update it with the result
+                for entry in app.entries.iter_mut().rev() {
+                    if let tui::ConversationEntry::ToolCall {
+                        tool_name: n,
+                        status,
+                        result_summary,
+                        ..
+                    } = entry
+                        && n == tool_name
+                        && *status == tui::ToolCallStatus::Running
+                    {
+                        *status = tui::ToolCallStatus::Success;
+                        *result_summary = Some(result_str.to_string());
+                        break;
+                    }
+                }
+                app.scroll_to_bottom();
+                return;
+            }
+
+            // Otherwise, it's a normal ToolCallStarted — add entry if not present
             let already = app.entries.iter().any(|e| {
                 matches!(e, tui::ConversationEntry::ToolCall { tool_name: n, status: tui::ToolCallStatus::Running, .. } if n == tool_name)
             });
@@ -395,6 +452,7 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
                     tool_name: tool_name.clone(),
                     input_summary: summary,
                     status: tui::ToolCallStatus::Running,
+                    result_summary: None,
                 });
                 app.scroll_to_bottom();
             }
@@ -442,7 +500,9 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             )));
         }
 
-        KernelEvent::SessionStatus { .. } => {}
+        KernelEvent::SessionStatus { tokens_used, .. } => {
+            app.context_tokens = *tokens_used;
+        }
 
         KernelEvent::Error { error, .. } => {
             app.entries

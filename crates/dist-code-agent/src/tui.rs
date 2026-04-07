@@ -20,21 +20,90 @@ use ratatui::{
 use std::io;
 
 // ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+/// Color theme for the TUI. Centralizes all styling so it can be swapped.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct Theme {
+    pub user_input: Color,
+    pub assistant_text: Color,
+    pub tool_border: Color,
+    pub tool_running: Color,
+    pub tool_success: Color,
+    pub tool_failed: Color,
+    pub tool_result: Color,
+    pub permission: Color,
+    pub info: Color,
+    pub error: Color,
+    pub status_bar_bg: Color,
+    pub status_bar_fg: Color,
+    pub input_prompt: Color,
+    pub timestamp: Color,
+    pub code_block: Color,
+}
+
+impl Theme {
+    /// Default dark terminal theme.
+    pub fn dark() -> Self {
+        Self {
+            user_input: Color::Cyan,
+            assistant_text: Color::Reset,
+            tool_border: Color::DarkGray,
+            tool_running: Color::Yellow,
+            tool_success: Color::Green,
+            tool_failed: Color::Red,
+            tool_result: Color::DarkGray,
+            permission: Color::Yellow,
+            info: Color::DarkGray,
+            error: Color::Red,
+            status_bar_bg: Color::DarkGray,
+            status_bar_fg: Color::White,
+            input_prompt: Color::Cyan,
+            timestamp: Color::DarkGray,
+            code_block: Color::Green,
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::dark()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------
+
+/// Format a SystemTime as HH:MM for display.
+fn format_time(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Local time approximation: just use UTC offset from environment
+    // (proper timezone handling would need chrono, not worth the dep)
+    let hours = (secs / 3600) % 24;
+    let minutes = (secs / 60) % 60;
+    format!("{hours:02}:{minutes:02}")
+}
 
 /// A single entry in the conversation log.
 #[derive(Clone)]
 pub enum ConversationEntry {
     /// User message.
-    UserInput(String),
+    UserInput(String, std::time::SystemTime),
     /// Model text output.
-    AssistantText(String),
+    AssistantText(String, std::time::SystemTime),
     /// A tool call (may still be running).
     ToolCall {
         tool_name: String,
         input_summary: String,
         status: ToolCallStatus,
+        /// Tool result (populated after execution).
+        result_summary: Option<String>,
     },
     /// Permission request awaiting user decision.
     PermissionPrompt {
@@ -62,6 +131,8 @@ pub enum ToolCallStatus {
 
 /// Holds the entire TUI application state.
 pub struct App {
+    /// Color theme.
+    pub theme: Theme,
     /// Conversation entries rendered in the main pane.
     pub entries: Vec<ConversationEntry>,
     /// Current input buffer.
@@ -80,6 +151,10 @@ pub struct App {
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
     pub turn_count: usize,
+    /// Context tokens used (from SessionStatus).
+    pub context_tokens: usize,
+    /// Context window size.
+    pub context_window: usize,
 
     /// Whether a turn is currently running.
     pub turn_active: bool,
@@ -103,6 +178,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
+            theme: Theme::default(),
             entries: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -113,6 +189,8 @@ impl App {
             total_input_tokens: 0,
             total_output_tokens: 0,
             turn_count: 0,
+            context_tokens: 0,
+            context_window: 200_000,
             turn_active: false,
             spinner_tick: 0,
             awaiting_permission: false,
@@ -286,11 +364,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_input(frame, app, chunks[2]);
 }
 
+fn format_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let left = " agent-kernel v0.1.0".to_string();
+    let ctx = format!(
+        "ctx: {}/{}",
+        format_tokens(app.context_tokens),
+        format_tokens(app.context_window)
+    );
     let right = format!(
-        "{} | tokens: {}in/{}out | turns: {} ",
-        app.model_name, app.total_input_tokens, app.total_output_tokens, app.turn_count,
+        "{} | {} | tokens: {}in/{}out | turns: {} ",
+        app.model_name,
+        ctx,
+        format_tokens(app.total_input_tokens),
+        format_tokens(app.total_output_tokens),
+        app.turn_count,
     );
 
     let padding = area.width as usize
@@ -298,8 +395,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         - right.len().min(area.width as usize);
     let bar_text = format!("{left}{:width$}{right}", "", width = padding.max(1));
 
-    let bar = Paragraph::new(Line::from(bar_text))
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let bar = Paragraph::new(Line::from(bar_text)).style(
+        Style::default()
+            .bg(app.theme.status_bar_bg)
+            .fg(app.theme.status_bar_fg),
+    );
     frame.render_widget(bar, area);
 }
 
@@ -310,49 +410,74 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
 
     for entry in &app.entries {
         match entry {
-            ConversationEntry::UserInput(text) => {
+            ConversationEntry::UserInput(text, time) => {
+                let ts = format_time(*time);
                 lines.push(Line::from(""));
-                for l in text.lines() {
+                for (i, l) in text.lines().enumerate() {
+                    let prefix = if i == 0 {
+                        format!("{ts} > ")
+                    } else {
+                        " ".repeat(ts.len() + 3)
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(
-                            "> ",
+                            prefix,
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(app.theme.user_input)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             l.to_string(),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(app.theme.user_input)
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ]));
                 }
             }
 
-            ConversationEntry::AssistantText(text) => {
+            ConversationEntry::AssistantText(text, time) => {
+                let ts = format_time(*time);
                 lines.push(Line::from(""));
-                lines.extend(markdown_to_lines(text));
+                let rendered = markdown_to_lines(text);
+                for (i, line) in rendered.into_iter().enumerate() {
+                    if i == 0 {
+                        // Prepend timestamp to first line
+                        let mut spans = vec![Span::styled(
+                            format!("{ts} "),
+                            Style::default().fg(app.theme.timestamp),
+                        )];
+                        spans.extend(line.spans);
+                        lines.push(Line::from(spans));
+                    } else {
+                        lines.push(line);
+                    }
+                }
             }
 
             ConversationEntry::ToolCall {
                 tool_name,
                 input_summary,
                 status,
+                result_summary,
             } => {
                 lines.push(Line::from(""));
                 let (indicator, style) = match status {
                     ToolCallStatus::Running => {
                         let ch = SPINNER[app.spinner_tick % SPINNER.len()];
-                        (format!(" {ch}"), Style::default().fg(Color::Yellow))
+                        (
+                            format!(" {ch}"),
+                            Style::default().fg(app.theme.tool_running),
+                        )
                     }
                     ToolCallStatus::Success => (
-                        " \u{2713}".to_string(), // checkmark
-                        Style::default().fg(Color::Green),
+                        " \u{2713}".to_string(),
+                        Style::default().fg(app.theme.tool_success),
                     ),
-                    ToolCallStatus::Failed(msg) => {
-                        (format!(" \u{2717} {msg}"), Style::default().fg(Color::Red))
-                    }
+                    ToolCallStatus::Failed(msg) => (
+                        format!(" \u{2717} {msg}"),
+                        Style::default().fg(app.theme.tool_failed),
+                    ),
                 };
 
                 // Top border
@@ -364,7 +489,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )));
 
-                // Content line(s)
+                // Input line
                 let summary = if input_summary.len() > inner_width.saturating_sub(6) {
                     format!(
                         "{}...",
@@ -381,6 +506,42 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                     Span::raw(summary),
                     Span::styled(indicator, style),
                 ]));
+
+                // Result lines (inside the box, truncated)
+                if let Some(result) = result_summary {
+                    let max_result_lines = 6;
+                    let result_lines: Vec<&str> = result.lines().collect();
+                    let truncated = result_lines.len() > max_result_lines;
+                    for line in result_lines.iter().take(max_result_lines) {
+                        let content = if line.len() > inner_width.saturating_sub(4) {
+                            format!("{}...", &line[..inner_width.saturating_sub(7).max(4)])
+                        } else {
+                            line.to_string()
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "\u{2502} ".to_string(),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(content, Style::default().fg(Color::DarkGray)),
+                        ]));
+                    }
+                    if truncated {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "\u{2502} ".to_string(),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                format!(
+                                    "... ({} more lines)",
+                                    result_lines.len() - max_result_lines
+                                ),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
+                }
 
                 // Bottom border
                 let bottom_inner = inner_width.saturating_sub(2);
@@ -456,12 +617,25 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let total_lines = lines.len() as u16;
-    app.rendered_lines = total_lines;
+    // Compute visual line count accounting for word wrap.
+    // Each logical line wraps to ceil(width / viewport_width) visual rows.
+    let viewport_width = area.width.max(1) as usize;
+    let total_visual_lines: u16 = lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if line_width == 0 {
+                1
+            } else {
+                line_width.div_ceil(viewport_width) as u16
+            }
+        })
+        .sum();
+    app.rendered_lines = total_visual_lines;
 
-    let viewport_height = area.height.saturating_sub(2); // borders
+    let viewport_height = area.height;
     if app.follow {
-        app.scroll = total_lines.saturating_sub(viewport_height);
+        app.scroll = total_visual_lines.saturating_sub(viewport_height);
     }
 
     let conversation = Paragraph::new(lines)
@@ -486,7 +660,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let prompt_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(app.theme.input_prompt)
         .add_modifier(Modifier::BOLD);
 
     // Build lines: first line gets the prompt, subsequent lines get indent
