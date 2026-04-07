@@ -1,4 +1,5 @@
 mod tools;
+mod tui;
 
 use kernel_interfaces::framing::{read_message, write_message};
 use kernel_interfaces::protocol::{KernelEvent, KernelRequest, SessionCreateConfig};
@@ -8,21 +9,25 @@ use std::env;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 
 fn main() {
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Parse args
-    let socket_path = env::args()
+    let args: Vec<String> = env::args().collect();
+    let repl_mode = args.iter().any(|a| a == "--repl");
+
+    let socket_path = args
+        .iter()
         .position(|a| a == "--socket")
-        .and_then(|i| env::args().nth(i + 1))
+        .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
 
     let socket_path = match socket_path {
         Some(p) => p,
         None => {
-            // Try to find a running daemon socket
-            // Try to find a running daemon socket in /tmp
             let found = std::fs::read_dir("/tmp").ok().and_then(|entries| {
                 entries
                     .filter_map(|e| e.ok())
@@ -44,34 +49,42 @@ fn main() {
         }
     };
 
-    // Connect to daemon
-    let stream = UnixStream::connect(&socket_path).unwrap_or_else(|e| {
+    if repl_mode {
+        run_repl(&socket_path, &workspace);
+    } else {
+        run_tui(&socket_path, &workspace);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared: connect + register + create session
+// ---------------------------------------------------------------------------
+
+struct DaemonConnection {
+    writer: std::sync::Arc<std::sync::Mutex<BufWriter<UnixStream>>>,
+    reader: BufReader<UnixStream>,
+}
+
+fn connect_and_setup(
+    socket_path: &std::path::Path,
+    workspace: &std::path::Path,
+    local_tools: &[Box<dyn kernel_interfaces::tool::ToolRegistration>],
+) -> DaemonConnection {
+    let stream = UnixStream::connect(socket_path).unwrap_or_else(|e| {
         eprintln!("Failed to connect to {}: {e}", socket_path.display());
         std::process::exit(1);
     });
-
-    eprintln!("Connected to daemon at {}", socket_path.display());
 
     let write_stream = stream.try_clone().expect("clone stream");
     let read_stream = stream;
 
     let writer = std::sync::Arc::new(std::sync::Mutex::new(BufWriter::new(write_stream)));
-    let writer_for_reader = writer.clone();
 
-    // Create local tools
-    let local_tools = tools::create_tools(&workspace);
     let tool_schemas: Vec<_> = local_tools
         .iter()
         .map(|t| tools::to_schema(t.as_ref()))
         .collect();
-    let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
 
-    eprintln!("agent-kernel v0.1.0 — code-agent distribution (IPC client)");
-    eprintln!("Workspace: {}", workspace.display());
-    eprintln!("Tools: {}", tool_names.join(", "));
-    eprintln!("---");
-
-    // Build default policy
     let policy = kernel_interfaces::policy::Policy {
         version: 1,
         name: "default-permissive".into(),
@@ -94,7 +107,8 @@ fn main() {
         resource_budgets: None,
     };
 
-    // Send RegisterTools
+    let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
+
     {
         let mut w = writer.lock().unwrap();
         write_message(
@@ -105,7 +119,6 @@ fn main() {
         )
         .expect("send RegisterTools");
 
-        // Send CreateSession
         write_message(
             &mut *w,
             &KernelRequest::CreateSession {
@@ -129,10 +142,337 @@ fn main() {
         .expect("send CreateSession");
     }
 
-    // Spawn reader thread that handles incoming KernelEvents
-    let local_tools_for_reader: Vec<_> = tools::create_tools(&workspace);
+    let reader = BufReader::new(read_stream);
+    DaemonConnection { writer, reader }
+}
+
+// ---------------------------------------------------------------------------
+// TUI mode
+// ---------------------------------------------------------------------------
+
+fn run_tui(socket_path: &std::path::Path, workspace: &std::path::Path) {
+    let local_tools = tools::create_tools(workspace);
+    let conn = connect_and_setup(socket_path, workspace, &local_tools);
+    let writer = conn.writer;
+
+    // Channel: reader thread sends KernelEvents to the TUI main loop
+    let (event_tx, event_rx) = mpsc::channel::<KernelEvent>();
+
+    // Spawn reader thread that receives KernelEvents and executes tools
+    let writer_for_reader = writer.clone();
+    let local_tools_for_reader = tools::create_tools(workspace);
+    std::thread::spawn(move || {
+        let mut reader = conn.reader;
+        loop {
+            let kernel_event: KernelEvent = match read_message(&mut reader) {
+                Ok(e) => e,
+                Err(e) => {
+                    if e.kind() != io::ErrorKind::UnexpectedEof {
+                        let _ = event_tx.send(KernelEvent::Error {
+                            session_id: None,
+                            error: kernel_interfaces::frontend::KernelError {
+                                message: format!("Read error: {e}"),
+                                recoverable: false,
+                            },
+                        });
+                    }
+                    break;
+                }
+            };
+
+            // Handle tool execution on this thread, but also forward the
+            // event to the TUI for display.
+            match &kernel_event {
+                KernelEvent::ExecuteTool {
+                    request_id,
+                    tool_name,
+                    input,
+                    ..
+                } => {
+                    // Forward ToolCallStarted-equivalent to TUI
+                    let _ = event_tx.send(kernel_event.clone());
+
+                    let (result, invalidations) = if let Some(tool) = local_tools_for_reader
+                        .iter()
+                        .find(|t| t.name() == tool_name)
+                    {
+                        match tool.execute(input.clone()) {
+                            Ok(output) => (output.result, output.invalidations),
+                            Err(e) => (serde_json::json!({"error": e.to_string()}), vec![]),
+                        }
+                    } else {
+                        (
+                            serde_json::json!({"error": "tool not found", "name": tool_name}),
+                            vec![],
+                        )
+                    };
+
+                    let mut w = writer_for_reader.lock().unwrap();
+                    let _ = write_message(
+                        &mut *w,
+                        &KernelRequest::ToolResult {
+                            request_id: *request_id,
+                            result,
+                            invalidations,
+                        },
+                    );
+                }
+                _ => {
+                    let _ = event_tx.send(kernel_event);
+                }
+            }
+        }
+    });
+
+    // Initialize terminal
+    let mut terminal = tui::init_terminal().unwrap_or_else(|e| {
+        eprintln!("Failed to init terminal: {e}");
+        std::process::exit(1);
+    });
+
+    let mut app = tui::App::new();
+
+    // Wait briefly for SessionCreated
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Drain any initial events
+    while let Ok(ev) = event_rx.try_recv() {
+        apply_event(&mut app, &ev);
+    }
+
+    // Main TUI event loop
+    let result = run_tui_loop(&mut terminal, &mut app, &event_rx, &writer);
+
+    // Shutdown
+    {
+        let mut w = writer.lock().unwrap();
+        let _ = write_message(&mut *w, &KernelRequest::Shutdown);
+    }
+
+    tui::restore_terminal();
+
+    if let Err(e) = result {
+        eprintln!("TUI error: {e}");
+    }
+
+    eprintln!("\nGoodbye.");
+}
+
+fn run_tui_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    app: &mut tui::App,
+    event_rx: &mpsc::Receiver<KernelEvent>,
+    writer: &std::sync::Arc<std::sync::Mutex<BufWriter<UnixStream>>>,
+) -> io::Result<()> {
+    loop {
+        // Draw
+        terminal.draw(|frame| tui::draw(frame, app))?;
+
+        // Poll for crossterm events (keyboard) with a short timeout so we can
+        // also check for kernel events.
+        if crossterm::event::poll(Duration::from_millis(50))?
+            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
+        {
+            match tui::handle_key(app, key) {
+                tui::InputAction::Submit(text) => {
+                    app.entries
+                        .push(tui::ConversationEntry::UserInput(text.clone()));
+                    app.scroll_to_bottom();
+                    app.turn_active = true;
+
+                    let mut w = writer.lock().unwrap();
+                    let _ = write_message(
+                        &mut *w,
+                        &KernelRequest::AddInput {
+                            session_id: kernel_interfaces::types::SessionId(0),
+                            text,
+                        },
+                    );
+                }
+                tui::InputAction::PermissionDecision(allow) => {
+                    if let Some(req_id) = app.pending_permission_request_id.take() {
+                        let decision = if allow {
+                            Decision::Allow
+                        } else {
+                            Decision::Deny("user denied".into())
+                        };
+
+                        // Remove the permission prompt entry
+                        app.entries.retain(|e| {
+                            !matches!(e, tui::ConversationEntry::PermissionPrompt { .. })
+                        });
+
+                        app.awaiting_permission = false;
+
+                        let mut w = writer.lock().unwrap();
+                        let _ = write_message(
+                            &mut *w,
+                            &KernelRequest::PermissionResponse {
+                                request_id: kernel_interfaces::protocol::RequestId(req_id),
+                                decision,
+                            },
+                        );
+                    }
+                }
+                tui::InputAction::Cancel => {
+                    let mut w = writer.lock().unwrap();
+                    let _ = write_message(
+                        &mut *w,
+                        &KernelRequest::CancelTurn {
+                            session_id: kernel_interfaces::types::SessionId(0),
+                        },
+                    );
+                }
+                tui::InputAction::Quit => return Ok(()),
+                tui::InputAction::None => {}
+            }
+        }
+
+        // Drain kernel events
+        while let Ok(ev) = event_rx.try_recv() {
+            apply_event(app, &ev);
+        }
+
+        // Advance spinner
+        if app.turn_active {
+            app.spinner_tick = app.spinner_tick.wrapping_add(1);
+        }
+    }
+}
+
+/// Map a KernelEvent into App state mutations.
+fn apply_event(app: &mut tui::App, event: &KernelEvent) {
+    match event {
+        KernelEvent::SessionCreated { .. } => {
+            app.entries
+                .push(tui::ConversationEntry::Info("Session created.".into()));
+        }
+
+        KernelEvent::TextOutput { text, .. } => {
+            // Merge consecutive assistant text entries
+            if let Some(tui::ConversationEntry::AssistantText(existing)) = app.entries.last_mut() {
+                existing.push('\n');
+                existing.push_str(text);
+            } else {
+                app.entries
+                    .push(tui::ConversationEntry::AssistantText(text.clone()));
+            }
+            app.scroll_to_bottom();
+        }
+
+        KernelEvent::ExecuteTool {
+            tool_name, input, ..
+        } => {
+            let input_str = input.to_string();
+            let summary = if input_str.len() > 120 {
+                format!("{}...", &input_str[..120])
+            } else {
+                input_str
+            };
+            app.entries.push(tui::ConversationEntry::ToolCall {
+                tool_name: tool_name.clone(),
+                input_summary: summary,
+                status: tui::ToolCallStatus::Running,
+            });
+            app.scroll_to_bottom();
+        }
+
+        KernelEvent::ToolCallStarted {
+            tool_name, input, ..
+        } => {
+            // Update existing Running entry to show it started, or add one
+            let already = app.entries.iter().any(|e| {
+                matches!(e, tui::ConversationEntry::ToolCall { tool_name: n, status: tui::ToolCallStatus::Running, .. } if n == tool_name)
+            });
+            if !already {
+                let input_str = input.to_string();
+                let summary = if input_str.len() > 120 {
+                    format!("{}...", &input_str[..120])
+                } else {
+                    input_str
+                };
+                app.entries.push(tui::ConversationEntry::ToolCall {
+                    tool_name: tool_name.clone(),
+                    input_summary: summary,
+                    status: tui::ToolCallStatus::Running,
+                });
+                app.scroll_to_bottom();
+            }
+        }
+
+        KernelEvent::PermissionRequired {
+            request_id,
+            request,
+            ..
+        } => {
+            app.awaiting_permission = true;
+            app.pending_permission_request_id = Some(request_id.0);
+            app.entries.push(tui::ConversationEntry::PermissionPrompt {
+                tool_name: request.tool_name.clone(),
+                capabilities: request.capabilities.clone(),
+                input_summary: request.input_summary.clone(),
+            });
+            app.scroll_to_bottom();
+        }
+
+        KernelEvent::TurnStarted { .. } => {
+            app.turn_active = true;
+        }
+
+        KernelEvent::TurnEnded { result, .. } => {
+            app.turn_active = false;
+            app.turn_count += 1;
+            app.total_input_tokens += result.input_tokens;
+            app.total_output_tokens += result.output_tokens;
+
+            // Mark any remaining Running tool calls as Success
+            for entry in &mut app.entries {
+                if let tui::ConversationEntry::ToolCall { status, .. } = entry
+                    && *status == tui::ToolCallStatus::Running
+                {
+                    *status = tui::ToolCallStatus::Success;
+                }
+            }
+        }
+
+        KernelEvent::CompactionHappened { summary, .. } => {
+            app.entries.push(tui::ConversationEntry::Info(format!(
+                "Context compacted: freed {} tokens ({} -> {} turns)",
+                summary.tokens_freed, summary.turns_before, summary.turns_after
+            )));
+        }
+
+        KernelEvent::SessionStatus { .. } => {}
+
+        KernelEvent::Error { error, .. } => {
+            app.entries
+                .push(tui::ConversationEntry::Error(error.message.clone()));
+            if !error.recoverable {
+                app.turn_active = false;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REPL mode (original behavior, for --repl flag)
+// ---------------------------------------------------------------------------
+
+fn run_repl(socket_path: &std::path::Path, workspace: &std::path::Path) {
+    let local_tools = tools::create_tools(workspace);
+    let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
+    let conn = connect_and_setup(socket_path, workspace, &local_tools);
+    let writer = conn.writer;
+
+    eprintln!("agent-kernel v0.1.0 — code-agent distribution (IPC client)");
+    eprintln!("Workspace: {}", workspace.display());
+    eprintln!("Tools: {}", tool_names.join(", "));
+    eprintln!("---");
+
+    let writer_for_reader = writer.clone();
+    let local_tools_for_reader = tools::create_tools(workspace);
     let reader_handle = std::thread::spawn(move || {
-        let mut reader = BufReader::new(read_stream);
+        let mut reader = conn.reader;
         loop {
             let event: KernelEvent = match read_message(&mut reader) {
                 Ok(e) => e,
@@ -155,7 +495,6 @@ fn main() {
                     input,
                     ..
                 } => {
-                    // Execute the tool locally
                     let input_str = input.to_string();
                     let display = if input_str.len() > 120 {
                         format!("{}...", &input_str[..120])
@@ -176,7 +515,7 @@ fn main() {
                                 } else {
                                     result_str
                                 };
-                                eprintln!("  [result] {tool_name} → {display}");
+                                eprintln!("  [result] {tool_name} -> {display}");
                                 (output.result, output.invalidations)
                             }
                             Err(e) => (serde_json::json!({"error": e.to_string()}), vec![]),
@@ -237,9 +576,7 @@ fn main() {
                     println!("{text}");
                 }
 
-                KernelEvent::ToolCallStarted { .. } => {
-                    // Already handled in ExecuteTool
-                }
+                KernelEvent::ToolCallStarted { .. } => {}
 
                 KernelEvent::TurnStarted { .. } => {}
 
@@ -274,10 +611,8 @@ fn main() {
         }
     });
 
-    // Wait for SessionCreated before starting REPL
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // REPL: read stdin, send AddInput
     let stdin = io::stdin();
     let mut stdin_reader = stdin.lock();
 
@@ -313,7 +648,6 @@ fn main() {
         );
     }
 
-    // Shutdown
     {
         let mut w = writer.lock().unwrap();
         let _ = write_message(&mut *w, &KernelRequest::Shutdown);
