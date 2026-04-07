@@ -182,12 +182,18 @@ fn main() {
     let socket_path = match socket_path {
         Some(p) => p,
         None => {
+            // Find the most recently modified daemon socket
             let found = std::fs::read_dir("/tmp").ok().and_then(|entries| {
                 entries
                     .filter_map(|e| e.ok())
-                    .find(|e| {
+                    .filter(|e| {
                         e.file_name().to_string_lossy().starts_with("agent-kernel-")
                             && e.file_name().to_string_lossy().ends_with(".sock")
+                    })
+                    .max_by_key(|e| {
+                        e.metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
                     })
                     .map(|e| e.path())
             });
