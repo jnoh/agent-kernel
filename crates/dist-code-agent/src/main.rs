@@ -434,8 +434,11 @@ fn run_tui_loop(
     writer: &std::sync::Arc<std::sync::Mutex<BufWriter<UnixStream>>>,
 ) -> io::Result<()> {
     loop {
-        // Draw
-        terminal.draw(|frame| tui::draw(frame, app))?;
+        // Only redraw when something changed
+        if app.dirty {
+            terminal.draw(|frame| tui::draw(frame, app))?;
+            app.dirty = false;
+        }
 
         // Poll for crossterm events (keyboard + mouse) with a short timeout
         // so we can also check for kernel events.
@@ -443,8 +446,14 @@ fn run_tui_loop(
             let action = match crossterm::event::read()? {
                 crossterm::event::Event::Key(key) => tui::handle_key(app, key),
                 crossterm::event::Event::Mouse(mouse) => tui::handle_mouse(app, mouse),
+                crossterm::event::Event::Resize(_, _) => {
+                    app.dirty = true;
+                    tui::InputAction::None
+                }
                 _ => tui::InputAction::None,
             };
+            // Any action (even None from typing/scrolling) means input was processed
+            app.dirty = true;
             match action {
                 tui::InputAction::Submit(text) => {
                     app.entries.push(tui::ConversationEntry::UserInput(
@@ -509,6 +518,7 @@ fn run_tui_loop(
                 turn_ended = true;
             }
             apply_event(app, &ev);
+            app.dirty = true;
         }
 
         // Query session status after a turn completes to update context usage
@@ -522,9 +532,10 @@ fn run_tui_loop(
             );
         }
 
-        // Advance spinner
+        // Advance spinner (only triggers redraw when turn is active)
         if app.turn_active {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
+            app.dirty = true;
         }
     }
 }

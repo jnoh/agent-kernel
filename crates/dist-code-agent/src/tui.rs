@@ -152,6 +152,8 @@ pub struct App {
     rendered_lines: u16,
     /// Viewport height of the conversation pane (computed each frame).
     viewport_height: u16,
+    /// Whether the UI needs redrawing.
+    pub dirty: bool,
 
     // --- Status bar fields ---
     pub model_name: String,
@@ -193,6 +195,7 @@ impl App {
             follow: true,
             rendered_lines: 0,
             viewport_height: 20,
+            dirty: true,
             model_name: "anthropic".into(),
             total_input_tokens: 0,
             total_output_tokens: 0,
