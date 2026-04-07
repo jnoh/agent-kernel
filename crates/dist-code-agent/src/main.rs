@@ -437,12 +437,15 @@ fn run_tui_loop(
         // Draw
         terminal.draw(|frame| tui::draw(frame, app))?;
 
-        // Poll for crossterm events (keyboard) with a short timeout so we can
-        // also check for kernel events.
-        if crossterm::event::poll(Duration::from_millis(50))?
-            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
-        {
-            match tui::handle_key(app, key) {
+        // Poll for crossterm events (keyboard + mouse) with a short timeout
+        // so we can also check for kernel events.
+        if crossterm::event::poll(Duration::from_millis(50))? {
+            let action = match crossterm::event::read()? {
+                crossterm::event::Event::Key(key) => tui::handle_key(app, key),
+                crossterm::event::Event::Mouse(mouse) => tui::handle_mouse(app, mouse),
+                _ => tui::InputAction::None,
+            };
+            match action {
                 tui::InputAction::Submit(text) => {
                     app.entries.push(tui::ConversationEntry::UserInput(
                         text.clone(),

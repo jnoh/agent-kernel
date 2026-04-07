@@ -6,7 +6,10 @@
 
 use crossterm::{
     ExecutableCommand,
-    event::{KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
+        MouseEventKind,
+    },
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
@@ -774,11 +777,13 @@ fn cursor_position_in_input(input: &str, cursor: usize) -> (usize, usize) {
 pub fn init_terminal() -> io::Result<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     Terminal::new(backend)
 }
 
 pub fn restore_terminal() {
+    let _ = io::stdout().execute(DisableMouseCapture);
     let _ = terminal::disable_raw_mode();
     let _ = io::stdout().execute(LeaveAlternateScreen);
 }
@@ -899,6 +904,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::PageDown => {
             let vh = app.viewport_height;
             app.scroll_down(vh, vh);
+            InputAction::None
+        }
+        _ => InputAction::None,
+    }
+}
+
+/// Process a mouse event, mutate App state, and return any action.
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> InputAction {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_up(3);
+            InputAction::None
+        }
+        MouseEventKind::ScrollDown => {
+            let vh = app.viewport_height;
+            app.scroll_down(3, vh);
             InputAction::None
         }
         _ => InputAction::None,
