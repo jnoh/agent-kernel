@@ -884,6 +884,7 @@ fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
             Event::End(TagEnd::Heading(_)) => {
                 flush_line(&mut current_spans, &mut lines);
                 heading_level = None;
+                lines.push(Line::from(""));
             }
 
             Event::Start(Tag::Emphasis) => italic = true,
@@ -907,6 +908,7 @@ fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
                 }
                 in_code_block = false;
                 code_block_buf.clear();
+                lines.push(Line::from(""));
             }
 
             Event::Start(Tag::List(_)) => list_depth += 1,
@@ -931,6 +933,7 @@ fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
             }
             Event::End(TagEnd::Paragraph) => {
                 flush_line(&mut current_spans, &mut lines);
+                lines.push(Line::from(""));
             }
 
             Event::Code(text) => {
