@@ -437,23 +437,9 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
                 return;
             }
 
-            // Otherwise, it's a normal ToolCallStarted — add entry if not present
-            let already = app.entries.iter().any(|e| {
-                matches!(e, tui::ConversationEntry::ToolCall { tool_name: n, status: tui::ToolCallStatus::Running, .. } if n == tool_name)
-            });
-            if !already {
-                let input_str = input.to_string();
-                let summary = if input_str.len() > 120 {
-                    format!("{}...", &input_str[..120])
-                } else {
-                    input_str
-                };
-                app.entries.push(tui::ConversationEntry::ToolCall {
-                    tool_name: tool_name.clone(),
-                    input_summary: summary,
-                    status: tui::ToolCallStatus::Running,
-                    result_summary: None,
-                });
+            // Normal ToolCallStarted from daemon — ignored because
+            // ExecuteTool already creates the entry.
+            {
                 app.scroll_to_bottom();
             }
         }
