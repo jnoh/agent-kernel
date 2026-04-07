@@ -456,10 +456,8 @@ fn run_tui_loop(
             app.dirty = true;
             match action {
                 tui::InputAction::Submit(text) => {
-                    app.entries.push(tui::ConversationEntry::UserInput(
-                        text.clone(),
-                        std::time::SystemTime::now(),
-                    ));
+                    app.entries
+                        .push(tui::ConversationEntry::UserInput(text.clone()));
                     app.scroll_to_bottom();
                     app.turn_active = true;
 
@@ -550,15 +548,12 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
 
         KernelEvent::TextOutput { text, .. } => {
             // Merge consecutive assistant text entries
-            if let Some(tui::ConversationEntry::AssistantText(existing, _)) = app.entries.last_mut()
-            {
+            if let Some(tui::ConversationEntry::AssistantText(existing)) = app.entries.last_mut() {
                 existing.push('\n');
                 existing.push_str(text);
             } else {
-                app.entries.push(tui::ConversationEntry::AssistantText(
-                    text.clone(),
-                    std::time::SystemTime::now(),
-                ));
+                app.entries
+                    .push(tui::ConversationEntry::AssistantText(text.clone()));
             }
             app.scroll_to_bottom();
         }
@@ -571,7 +566,6 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
                 input_summary: format_tool_input(tool_name, input),
                 status: tui::ToolCallStatus::Running(std::time::Instant::now()),
                 result_summary: None,
-                collapsed: false,
             });
             app.scroll_to_bottom();
         }
@@ -590,9 +584,10 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
                         ..
                     } = entry
                         && n == tool_name
-                        && matches!(status, tui::ToolCallStatus::Running(_))
+                        && let tui::ToolCallStatus::Running(start) = status
                     {
-                        *status = tui::ToolCallStatus::Success;
+                        let duration = start.elapsed();
+                        *status = tui::ToolCallStatus::Success(duration);
                         *result_summary = Some(result_str.to_string());
                         break;
                     }
@@ -636,36 +631,9 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             // Mark any remaining Running tool calls as Success
             for entry in &mut app.entries {
                 if let tui::ConversationEntry::ToolCall { status, .. } = entry
-                    && matches!(status, tui::ToolCallStatus::Running(_))
+                    && let tui::ToolCallStatus::Running(start) = status
                 {
-                    *status = tui::ToolCallStatus::Success;
-                }
-            }
-
-            // Auto-collapse successful tool calls except the last one,
-            // to reduce visual noise in multi-tool turns.
-            let mut last_tool_idx = None;
-            for (i, entry) in app.entries.iter().enumerate().rev() {
-                if matches!(
-                    entry,
-                    tui::ConversationEntry::ToolCall {
-                        status: tui::ToolCallStatus::Success,
-                        ..
-                    }
-                ) {
-                    last_tool_idx = Some(i);
-                    break;
-                }
-            }
-            for (i, entry) in app.entries.iter_mut().enumerate() {
-                if let tui::ConversationEntry::ToolCall {
-                    status: tui::ToolCallStatus::Success,
-                    collapsed,
-                    ..
-                } = entry
-                    && Some(i) != last_tool_idx
-                {
-                    *collapsed = true;
+                    *status = tui::ToolCallStatus::Success(start.elapsed());
                 }
             }
         }

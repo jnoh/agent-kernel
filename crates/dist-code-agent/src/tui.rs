@@ -80,26 +80,13 @@ impl Default for Theme {
 // Domain types
 // ---------------------------------------------------------------------------
 
-/// Format a SystemTime as HH:MM for display.
-fn format_time(t: std::time::SystemTime) -> String {
-    let secs = t
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Local time approximation: just use UTC offset from environment
-    // (proper timezone handling would need chrono, not worth the dep)
-    let hours = (secs / 3600) % 24;
-    let minutes = (secs / 60) % 60;
-    format!("{hours:02}:{minutes:02}")
-}
-
 /// A single entry in the conversation log.
 #[derive(Clone)]
 pub enum ConversationEntry {
     /// User message.
-    UserInput(String, std::time::SystemTime),
+    UserInput(String),
     /// Model text output.
-    AssistantText(String, std::time::SystemTime),
+    AssistantText(String),
     /// A tool call (may still be running).
     ToolCall {
         tool_name: String,
@@ -107,8 +94,6 @@ pub enum ConversationEntry {
         status: ToolCallStatus,
         /// Tool result (populated after execution).
         result_summary: Option<String>,
-        /// Whether to show compact (single-line) or expanded (box) view.
-        collapsed: bool,
     },
     /// Permission request awaiting user decision.
     PermissionPrompt {
@@ -126,7 +111,7 @@ pub enum ConversationEntry {
 #[allow(dead_code)]
 pub enum ToolCallStatus {
     Running(std::time::Instant),
-    Success,
+    Success(std::time::Duration),
     Failed(String),
 }
 
@@ -419,51 +404,29 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    for entry in &app.entries {
+    for (entry_idx, entry) in app.entries.iter().enumerate() {
         match entry {
-            ConversationEntry::UserInput(text, time) => {
-                let ts = format_time(*time);
-                lines.push(Line::from(""));
+            ConversationEntry::UserInput(text) => {
+                // Blank line before user input (conversation separator)
+                if entry_idx > 0 {
+                    lines.push(Line::from(""));
+                }
+                let user_style = Style::default()
+                    .fg(app.theme.user_input)
+                    .add_modifier(Modifier::BOLD);
                 for (i, l) in text.lines().enumerate() {
-                    let prefix = if i == 0 {
-                        format!("{ts} > ")
-                    } else {
-                        " ".repeat(ts.len() + 3)
-                    };
+                    let prefix = if i == 0 { "> " } else { "  " };
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            prefix,
-                            Style::default()
-                                .fg(app.theme.user_input)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            l.to_string(),
-                            Style::default()
-                                .fg(app.theme.user_input)
-                                .add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(prefix.to_string(), user_style),
+                        Span::styled(l.to_string(), user_style),
                     ]));
                 }
             }
 
-            ConversationEntry::AssistantText(text, time) => {
-                let ts = format_time(*time);
+            ConversationEntry::AssistantText(text) => {
+                // Blank line before assistant text
                 lines.push(Line::from(""));
-                let rendered = markdown_to_lines(text);
-                for (i, line) in rendered.into_iter().enumerate() {
-                    if i == 0 {
-                        // Prepend timestamp to first line
-                        let mut spans = vec![Span::styled(
-                            format!("{ts} "),
-                            Style::default().fg(app.theme.timestamp),
-                        )];
-                        spans.extend(line.spans);
-                        lines.push(Line::from(spans));
-                    } else {
-                        lines.push(line);
-                    }
-                }
+                lines.extend(markdown_to_lines(text));
             }
 
             ConversationEntry::ToolCall {
@@ -471,14 +434,27 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                 input_summary,
                 status,
                 result_summary,
-                collapsed,
             } => {
-                lines.push(Line::from(""));
+                // Format duration string
+                let duration_str = match status {
+                    ToolCallStatus::Success(d) => {
+                        let ms = d.as_millis();
+                        if ms < 1000 {
+                            format!(" ({ms}ms)")
+                        } else {
+                            format!(" ({:.1}s)", d.as_secs_f32())
+                        }
+                    }
+                    _ => String::new(),
+                };
 
-                // Compact single-line view for collapsed tool calls
-                if *collapsed {
+                // Compact single-line view for completed tool calls
+                let is_running = matches!(status, ToolCallStatus::Running(_));
+                let show_result = is_running || matches!(status, ToolCallStatus::Failed(_));
+
+                if !show_result {
                     let (indicator, style) = match status {
-                        ToolCallStatus::Success => {
+                        ToolCallStatus::Success(_) => {
                             ("\u{2713}", Style::default().fg(app.theme.tool_success))
                         }
                         ToolCallStatus::Failed(_) => {
@@ -488,15 +464,14 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                     };
                     lines.push(Line::from(vec![
                         Span::styled(format!("  {indicator} "), style),
-                        Span::styled(
-                            tool_name.clone(),
-                            Style::default()
-                                .fg(app.theme.tool_border)
-                                .add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(tool_name.clone(), Style::default().fg(app.theme.info)),
                         Span::styled(
                             format!(" {input_summary}"),
-                            Style::default().fg(app.theme.info),
+                            Style::default().fg(app.theme.tool_border),
+                        ),
+                        Span::styled(
+                            duration_str.clone(),
+                            Style::default().fg(app.theme.tool_border),
                         ),
                     ]));
                     continue;
@@ -512,10 +487,15 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                         };
                         (time_str, Style::default().fg(app.theme.tool_running))
                     }
-                    ToolCallStatus::Success => (
-                        " \u{2713}".to_string(),
-                        Style::default().fg(app.theme.tool_success),
-                    ),
+                    ToolCallStatus::Success(d) => {
+                        let ms = d.as_millis();
+                        let dur = if ms < 1000 {
+                            format!(" \u{2713} ({ms}ms)")
+                        } else {
+                            format!(" \u{2713} ({:.1}s)", d.as_secs_f32())
+                        };
+                        (dur, Style::default().fg(app.theme.tool_success))
+                    }
                     ToolCallStatus::Failed(msg) => (
                         format!(" \u{2717} {msg}"),
                         Style::default().fg(app.theme.tool_failed),
