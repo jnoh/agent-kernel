@@ -59,6 +59,7 @@ fn create_test_tools(workspace: &std::path::Path) -> Vec<Box<dyn ToolRegistratio
     vec![
         Box::new(TestFileRead(workspace.to_path_buf())),
         Box::new(TestFileWrite(workspace.to_path_buf())),
+        Box::new(TestFileEdit(workspace.to_path_buf())),
         Box::new(TestShell(workspace.to_path_buf())),
         Box::new(TestLs(workspace.to_path_buf())),
         Box::new(TestGrep(workspace.to_path_buf())),
@@ -143,6 +144,79 @@ impl ToolRegistration for TestFileWrite {
         fs::write(&full, content).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
         Ok(ToolOutput::with_invalidations(
             serde_json::json!({ "written": true }),
+            vec![Invalidation::Files(vec![full])],
+        ))
+    }
+}
+
+struct TestFileEdit(PathBuf);
+impl ToolRegistration for TestFileEdit {
+    fn name(&self) -> &str {
+        "file_edit"
+    }
+    fn description(&self) -> &str {
+        "Edit file via string replacement"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        Box::leak(Box::new(
+            [Capability::new("fs:write")].into_iter().collect(),
+        ))
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &serde_json::Value::Null
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(150)
+    }
+    fn relevance(&self) -> &RelevanceSignal {
+        Box::leak(Box::new(RelevanceSignal {
+            keywords: vec![],
+            tags: vec![],
+        }))
+    }
+    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("missing path".into()))?;
+        let old_string = input
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("missing old_string".into()))?;
+        let new_string = input
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("missing new_string".into()))?;
+        let full = self.0.join(path);
+
+        if old_string.is_empty() {
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            fs::write(&full, new_string).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            return Ok(ToolOutput::with_invalidations(
+                serde_json::json!({ "action": "created" }),
+                vec![Invalidation::Files(vec![full])],
+            ));
+        }
+
+        let content =
+            fs::read_to_string(&full).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let count = content.matches(old_string).count();
+        if count == 0 {
+            return Err(ToolError::ExecutionFailed(
+                "old_string not found in file".into(),
+            ));
+        }
+        if count > 1 {
+            return Err(ToolError::ExecutionFailed(format!(
+                "old_string matches {count} locations"
+            )));
+        }
+        let new_content = content.replacen(old_string, new_string, 1);
+        fs::write(&full, &new_content).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        Ok(ToolOutput::with_invalidations(
+            serde_json::json!({ "action": "edited" }),
             vec![Invalidation::Files(vec![full])],
         ))
     }
@@ -616,4 +690,105 @@ fn distro_policy_blocks_shell() {
     let r1 = session.run_turn(&provider, &frontend).unwrap();
     assert_eq!(r1.tool_calls_denied, 1);
     assert_eq!(r1.tool_calls_dispatched, 0);
+}
+
+/// Model edits a file via string replacement.
+#[test]
+fn distro_file_edit_replaces_string() {
+    let ws = setup_workspace();
+    let tools = create_test_tools(ws.path());
+    let mut mgr = SessionManager::new(ResourceBudget::default());
+    let id = mgr.spawn_interactive(session_config(ws.path()), tools);
+    let session = mgr.get_mut(id).unwrap();
+
+    session.add_user_input("Change the greeting".into());
+
+    let provider = ScriptedProvider::new(vec![Response {
+        content: vec![Content::ToolCall {
+            id: "c1".into(),
+            name: "file_edit".into(),
+            input: serde_json::json!({
+                "path": "hello.txt",
+                "old_string": "Hello, world!",
+                "new_string": "Greetings, universe!"
+            }),
+        }],
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+    }]);
+    let frontend = RecordingFrontend::auto_allow();
+
+    let r1 = session.run_turn(&provider, &frontend).unwrap();
+    assert!(r1.continues);
+    assert_eq!(r1.tool_calls_dispatched, 1);
+
+    let edited = fs::read_to_string(ws.path().join("hello.txt")).unwrap();
+    assert!(edited.contains("Greetings, universe!"));
+    assert!(!edited.contains("Hello, world!"));
+    // Other lines preserved
+    assert!(edited.contains("Line 2"));
+}
+
+/// file_edit with empty old_string creates a new file.
+#[test]
+fn distro_file_edit_creates_file() {
+    let ws = setup_workspace();
+    let tools = create_test_tools(ws.path());
+    let mut mgr = SessionManager::new(ResourceBudget::default());
+    let id = mgr.spawn_interactive(session_config(ws.path()), tools);
+    let session = mgr.get_mut(id).unwrap();
+
+    session.add_user_input("Create a config file".into());
+
+    let provider = ScriptedProvider::new(vec![Response {
+        content: vec![Content::ToolCall {
+            id: "c1".into(),
+            name: "file_edit".into(),
+            input: serde_json::json!({
+                "path": "config.toml",
+                "old_string": "",
+                "new_string": "[settings]\nkey = \"value\"\n"
+            }),
+        }],
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+    }]);
+    let frontend = RecordingFrontend::auto_allow();
+
+    let r1 = session.run_turn(&provider, &frontend).unwrap();
+    assert!(r1.continues);
+
+    let content = fs::read_to_string(ws.path().join("config.toml")).unwrap();
+    assert!(content.contains("key = \"value\""));
+}
+
+/// file_edit fails when old_string is not found.
+#[test]
+fn distro_file_edit_not_found() {
+    let ws = setup_workspace();
+    let tools = create_test_tools(ws.path());
+    let mut mgr = SessionManager::new(ResourceBudget::default());
+    let id = mgr.spawn_interactive(session_config(ws.path()), tools);
+    let session = mgr.get_mut(id).unwrap();
+
+    session.add_user_input("Edit something".into());
+
+    let provider = ScriptedProvider::new(vec![Response {
+        content: vec![Content::ToolCall {
+            id: "c1".into(),
+            name: "file_edit".into(),
+            input: serde_json::json!({
+                "path": "hello.txt",
+                "old_string": "this string does not exist",
+                "new_string": "replacement"
+            }),
+        }],
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+    }]);
+    let frontend = RecordingFrontend::auto_allow();
+
+    // Should not panic — error gets fed back to the model
+    let r1 = session.run_turn(&provider, &frontend).unwrap();
+    assert!(r1.continues);
 }

@@ -60,6 +60,7 @@ mod tests {
             tool_names: vec![
                 "file_read".into(),
                 "file_write".into(),
+                "file_edit".into(),
                 "shell".into(),
                 "grep".into(),
                 "ls".into(),

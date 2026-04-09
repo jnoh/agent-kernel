@@ -449,6 +449,132 @@ impl ToolRegistration for GrepTool {
 }
 
 // ============================================================================
+// file_edit
+// ============================================================================
+
+pub struct FileEditTool {
+    caps: CapabilitySet,
+    schema: serde_json::Value,
+    relevance: RelevanceSignal,
+    workspace: PathBuf,
+}
+
+impl FileEditTool {
+    pub fn new(workspace: PathBuf) -> Self {
+        Self {
+            caps: [Capability::new("fs:write")].into_iter().collect(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path relative to workspace" },
+                    "old_string": { "type": "string", "description": "The exact text to find and replace (must match uniquely)" },
+                    "new_string": { "type": "string", "description": "The replacement text" }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+            relevance: RelevanceSignal {
+                keywords: vec![
+                    "edit".into(),
+                    "replace".into(),
+                    "change".into(),
+                    "modify".into(),
+                    "update".into(),
+                ],
+                tags: vec!["filesystem".into()],
+            },
+            workspace,
+        }
+    }
+}
+
+impl ToolRegistration for FileEditTool {
+    fn name(&self) -> &str {
+        "file_edit"
+    }
+    fn description(&self) -> &str {
+        "Replace an exact string in a file with new text"
+    }
+    fn capabilities(&self) -> &CapabilitySet {
+        &self.caps
+    }
+    fn schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+    fn cost(&self) -> TokenEstimate {
+        TokenEstimate(150)
+    }
+    fn relevance(&self) -> &RelevanceSignal {
+        &self.relevance
+    }
+
+    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let path_str = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("missing 'path' parameter".into()))?;
+        let old_string = input
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("missing 'old_string' parameter".into()))?;
+        let new_string = input
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("missing 'new_string' parameter".into()))?;
+
+        let full_path = self.workspace.join(path_str);
+
+        // Creating a new file: old_string is empty, new_string is the content
+        if old_string.is_empty() {
+            if let Some(parent) = full_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ToolError::ExecutionFailed(format!("failed to create directories: {e}"))
+                })?;
+            }
+            std::fs::write(&full_path, new_string).map_err(|e| {
+                ToolError::ExecutionFailed(format!("failed to write {}: {e}", full_path.display()))
+            })?;
+            return Ok(ToolOutput::with_invalidations(
+                serde_json::json!({
+                    "path": path_str,
+                    "action": "created",
+                }),
+                vec![Invalidation::Files(vec![full_path])],
+            ));
+        }
+
+        let content = std::fs::read_to_string(&full_path).map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to read {}: {e}", full_path.display()))
+        })?;
+
+        // Check uniqueness
+        let match_count = content.matches(old_string).count();
+        if match_count == 0 {
+            return Err(ToolError::ExecutionFailed(
+                "old_string not found in file".into(),
+            ));
+        }
+        if match_count > 1 {
+            return Err(ToolError::ExecutionFailed(format!(
+                "old_string matches {match_count} locations — include more surrounding context to make it unique"
+            )));
+        }
+
+        let new_content = content.replacen(old_string, new_string, 1);
+        std::fs::write(&full_path, &new_content).map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to write {}: {e}", full_path.display()))
+        })?;
+
+        Ok(ToolOutput::with_invalidations(
+            serde_json::json!({
+                "path": path_str,
+                "action": "edited",
+            }),
+            vec![Invalidation::Files(vec![full_path])],
+        ))
+    }
+}
+
+// ============================================================================
 // Factory
 // ============================================================================
 
@@ -469,6 +595,7 @@ pub fn create_tools(workspace: &Path) -> Vec<Box<dyn ToolRegistration>> {
     vec![
         Box::new(FileReadTool::new(workspace.to_path_buf())),
         Box::new(FileWriteTool::new(workspace.to_path_buf())),
+        Box::new(FileEditTool::new(workspace.to_path_buf())),
         Box::new(ShellTool::new(workspace.to_path_buf())),
         Box::new(LsTool::new(workspace.to_path_buf())),
         Box::new(GrepTool::new(workspace.to_path_buf())),
