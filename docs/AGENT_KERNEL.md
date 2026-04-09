@@ -10,7 +10,7 @@
 
 agent-kernel is a runtime layer for building AI agents. It sits below application-level agent frameworks (LangGraph, CrewAI) and above model APIs and protocols (MCP, A2A). It provides three core primitives that no existing framework unifies: tiered context management, capability-based tool dispatch, and defense-in-depth security.
 
-The kernel is not an agent. It is the thing agents are built on. Different agent harnesses — coding agents, support agents, legal agents, CI agents — are **distributions** that package the kernel with domain-specific tools, policies, and frontends. The relationship is the same as Linux kernel to Ubuntu/Fedora/Android.
+The kernel is not an agent. It is the thing agents are built on. Different agent harnesses — coding agents, support agents, legal agents, CI agents — are **distributions** that package the kernel with domain-specific tools, policies, and frontends. Like Ubuntu packages the Linux kernel with GNOME and apt, or Android packages it with Dalvik and Play Services.
 
 ### What v0.1 must ship
 
