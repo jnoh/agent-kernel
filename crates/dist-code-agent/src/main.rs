@@ -1,3 +1,4 @@
+mod prompt;
 mod tools;
 mod tui;
 
@@ -284,14 +285,10 @@ fn connect_and_setup(
             &KernelRequest::CreateSession {
                 config: SessionCreateConfig {
                     mode: SessionMode::Interactive,
-                    system_prompt: format!(
-                        "You are a coding assistant. You have access to the following tools: {}. \
-                         The workspace root is {}. \
-                         Use tools to help the user with their coding tasks. \
-                         Be concise and direct.",
-                        tool_names.join(", "),
-                        workspace.display()
-                    ),
+                    system_prompt: prompt::build_system_prompt(&prompt::PromptContext {
+                        workspace: workspace.display().to_string(),
+                        tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
+                    }),
                     completion_config: CompletionConfig::default(),
                     policy,
                     resource_budget: ResourceBudget::default(),
