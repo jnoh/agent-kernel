@@ -17,15 +17,9 @@ Current state: ratatui TUI with markdown rendering, input history, multiline inp
 - Color theme struct
 - Daemon reconnection support
 - Duplicate tool call fix
+- Slash commands (`/clear`, `/compact`, `/status`, `/quit`)
 
 ## Open
-
-### G1. Slash commands — [ ]
-- `/clear` — clear conversation display
-- `/compact` — send `RequestCompaction` to daemon
-- `/status` — send `QuerySession`, show result inline
-- `/quit` — already exists
-- Scope: command parser in `InputAction::Submit` path
 
 ### G2. Permission "always allow" — [ ]
 - `a` key during permission prompt = always allow this tool for the session

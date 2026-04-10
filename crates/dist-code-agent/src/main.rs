@@ -501,6 +501,37 @@ fn run_tui_loop(
                         },
                     );
                 }
+                tui::InputAction::SlashCommand(cmd) => match cmd {
+                    tui::SlashCommand::Clear => {
+                        app.entries.clear();
+                        app.scroll_to_bottom();
+                    }
+                    tui::SlashCommand::Compact => {
+                        let mut w = writer.lock().unwrap();
+                        let _ = write_message(
+                            &mut *w,
+                            &KernelRequest::RequestCompaction {
+                                session_id: kernel_interfaces::types::SessionId(0),
+                            },
+                        );
+                    }
+                    tui::SlashCommand::Status => {
+                        let mut w = writer.lock().unwrap();
+                        let _ = write_message(
+                            &mut *w,
+                            &KernelRequest::QuerySession {
+                                session_id: kernel_interfaces::types::SessionId(0),
+                            },
+                        );
+                    }
+                    tui::SlashCommand::Quit => return Ok(()),
+                    tui::SlashCommand::Unknown(name) => {
+                        app.entries.push(tui::ConversationEntry::Error(format!(
+                            "unknown command: {name}"
+                        )));
+                        app.scroll_to_bottom();
+                    }
+                },
                 tui::InputAction::Quit => return Ok(()),
                 tui::InputAction::None => {}
             }
@@ -642,8 +673,20 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             )));
         }
 
-        KernelEvent::SessionStatus { tokens_used, .. } => {
+        KernelEvent::SessionStatus {
+            tokens_used,
+            utilization,
+            turn_count,
+            ..
+        } => {
             app.context_tokens = *tokens_used;
+            app.entries.push(tui::ConversationEntry::Info(format!(
+                "Session status: {} tokens used ({:.1}% of context), {} turns",
+                tokens_used,
+                utilization * 100.0,
+                turn_count,
+            )));
+            app.scroll_to_bottom();
         }
 
         KernelEvent::Error { error, .. } => {

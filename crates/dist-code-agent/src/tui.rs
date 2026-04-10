@@ -779,6 +779,8 @@ pub fn restore_terminal() {
 pub enum InputAction {
     /// User submitted text (pressed Enter).
     Submit(String),
+    /// User submitted a slash command.
+    SlashCommand(SlashCommand),
     /// User pressed y/n for a permission prompt.
     PermissionDecision(bool),
     /// User wants to cancel the current turn (Ctrl+C / Esc while turn active).
@@ -787,6 +789,36 @@ pub enum InputAction {
     Quit,
     /// No action needed (navigation, typing, etc — already handled).
     None,
+}
+
+/// A parsed slash command from the input bar.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SlashCommand {
+    /// `/clear` — clear the conversation display (no daemon round-trip).
+    Clear,
+    /// `/compact` — request context compaction.
+    Compact,
+    /// `/status` — query session status.
+    Status,
+    /// `/quit` or `/exit` — quit the TUI.
+    Quit,
+    /// Leading `/` but not a recognized command.
+    Unknown(String),
+}
+
+/// Parse a submitted line. Returns `Some(cmd)` if it begins with `/`, else `None`.
+pub fn parse_slash_command(text: &str) -> Option<SlashCommand> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    Some(match trimmed {
+        "/clear" => SlashCommand::Clear,
+        "/compact" => SlashCommand::Compact,
+        "/status" => SlashCommand::Status,
+        "/quit" | "/exit" => SlashCommand::Quit,
+        other => SlashCommand::Unknown(other.to_string()),
+    })
 }
 
 /// Process a crossterm key event, mutate App state, and return any action
@@ -829,8 +861,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
             if text.is_empty() {
                 return InputAction::None;
             }
-            if text == "/quit" || text == "/exit" {
-                return InputAction::Quit;
+            if let Some(cmd) = parse_slash_command(&text) {
+                return InputAction::SlashCommand(cmd);
             }
             InputAction::Submit(text)
         }
@@ -1095,4 +1127,49 @@ fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_clear() {
+        assert_eq!(parse_slash_command("/clear"), Some(SlashCommand::Clear));
+    }
+
+    #[test]
+    fn parse_compact() {
+        assert_eq!(parse_slash_command("/compact"), Some(SlashCommand::Compact));
+    }
+
+    #[test]
+    fn parse_status() {
+        assert_eq!(parse_slash_command("/status"), Some(SlashCommand::Status));
+    }
+
+    #[test]
+    fn parse_quit_and_exit() {
+        assert_eq!(parse_slash_command("/quit"), Some(SlashCommand::Quit));
+        assert_eq!(parse_slash_command("/exit"), Some(SlashCommand::Quit));
+    }
+
+    #[test]
+    fn parse_unknown_command() {
+        assert_eq!(
+            parse_slash_command("/foo"),
+            Some(SlashCommand::Unknown("/foo".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_normal_message_is_not_a_command() {
+        assert_eq!(parse_slash_command("hello world"), None);
+        assert_eq!(parse_slash_command("not a /command"), None);
+    }
+
+    #[test]
+    fn parse_trims_whitespace() {
+        assert_eq!(parse_slash_command("  /clear  "), Some(SlashCommand::Clear));
+    }
 }
