@@ -80,6 +80,10 @@ There are currently 11 unit tests in `kernel-interfaces` covering policy evaluat
 - **Session manager** (`kernel-core/src/session.rs`): Currently single-session; multi-session interface deferred to v0.2.
 - Policy files in `policies/` define capability rules (allow/deny/ask) per tool category.
 
+## Spec-driven workflow
+
+This project is built semi-autonomously from scoped specs in `specs/`. When the user describes a unit of work or points you at a file in `specs/`, follow `docs/spec-protocol.md` — it covers both authoring new specs (from `specs/_template.md`) and executing existing ones.
+
 ## What's Deferred to v0.2
 
 - OS-level sandbox (seccomp-BPF, namespaces)
