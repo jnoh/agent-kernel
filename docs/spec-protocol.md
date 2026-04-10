@@ -69,9 +69,14 @@ Procedure:
 1. Read the spec file in full. Pay attention to "Acceptance criteria" and
    "Out of scope".
 2. Run the diff command and read the full diff.
-3. For each acceptance criterion, also read the relevant code in its
-   post-diff state. A criterion may depend on code the diff did not touch —
-   do not trust the diff alone.
+3. For each acceptance criterion:
+   (a) If it is a runtime check (a shell command, test invocation, build
+       command, or anything else with an objective pass/fail outcome),
+       EXECUTE it yourself and use the result as evidence. Do not trust
+       the executor's claim that it passed — run it.
+   (b) Otherwise, read the relevant code in its post-diff state. A
+       criterion may depend on code the diff did not touch; do not trust
+       the diff alone.
 4. Answer the three questions below in the exact format specified. No
    preamble, no summary, no commentary outside the format. Start directly
    with "## Question 1".
@@ -80,15 +85,18 @@ Procedure:
 
 For EACH item in the spec's "Acceptance criteria" section, give one verdict:
 
-- MET — provably satisfied. Cite the file:line or test name that proves it.
-- NOT MET — not satisfied. Explain what is missing.
-- AMBIGUOUS — the criterion text itself is unclear or unprovable as written.
-  Explain what is unclear. Do NOT guess. If you cannot tell what would count
-  as satisfying it, mark AMBIGUOUS — do not infer intent.
+- MET — provably satisfied. Cite the file:line, test name, or command
+  output that proves it. For runtime criteria, "I ran X and it exited 0"
+  is valid evidence; "the executor says it passes" is not.
+- NOT MET — not satisfied. Explain what is missing or what failed.
+- AMBIGUOUS — the criterion text itself is unclear or unprovable as written
+  (e.g., "feels responsive"). Explain what is unclear. Do NOT guess. Do not
+  use AMBIGUOUS as a way to skip a runtime check you did not run — runtime
+  checks must be executed.
 
 Format (one bullet per criterion, verbatim criterion text):
-- [criterion text]: MET — [evidence: file:line or test name]
-- [criterion text]: NOT MET — [what is missing]
+- [criterion text]: MET — [evidence: file:line, test name, or command output]
+- [criterion text]: NOT MET — [what is missing or what failed]
 - [criterion text]: AMBIGUOUS — [what is unclear]
 
 ## Question 2: Out-of-scope check
