@@ -61,7 +61,7 @@ cargo fmt
 cargo fmt -- --check && cargo clippy && cargo test
 ```
 
-There are currently 11 unit tests in `kernel-interfaces` covering policy evaluation, tool output, and capability matching. Integration tests in `dist-code-agent` exercise real filesystem operations via `tempfile`.
+`kernel-interfaces` unit tests cover policy evaluation, tool output, and capability matching. `dist-code-agent` integration tests exercise real filesystem operations via `tempfile`.
 
 ## Code Conventions
 
@@ -77,17 +77,14 @@ There are currently 11 unit tests in `kernel-interfaces` covering policy evaluat
 - **Turn loop** (`kernel-core/src/turn_loop.rs`): The main execution loop — assembles prompt, calls model, dispatches tools, feeds results back.
 - **Permission evaluator** (`kernel-core/src/permission.rs`): Policy-file-driven dispatch gating with first-match-wins semantics.
 - **Context manager** (`kernel-core/src/context.rs`): Tiered memory with token budgets and invalidation tracking.
-- **Session manager** (`kernel-core/src/session.rs`): Currently single-session; multi-session interface deferred to v0.2.
+- **Session manager** (`kernel-core/src/session.rs`): Single-session.
 - Policy files in `policies/` define capability rules (allow/deny/ask) per tool category.
 
 ## Spec-driven workflow
 
 This project is built semi-autonomously from scoped specs in `specs/`. When the user describes a unit of work or points you at a file in `specs/`, follow `docs/spec-protocol.md` — it covers both authoring new specs (from `specs/_template.md`) and executing existing ones.
 
-## What's Deferred to v0.2
+## Commit hygiene
 
-- OS-level sandbox (seccomp-BPF, namespaces)
-- Multi-session support and sub-agent spawning
-- Tool registry / marketplace
-- Benchmark harness
-- Web UI and IDE extension frontends
+- **One commit per logical concern.** If the working tree contains work from two unrelated concerns, split them — commit the foundational or older one first, then the new one. Bundling unrelated work makes future bisects, reverts, and history reading harder.
+- **Before committing, sanity-check the file set.** Run `git status` and ask: do all these files belong to the same change? If not, stage subsets separately. Spec-driven work should be a particularly clean case — the commit's file set should match the spec's authorized scope (the files acceptance criteria touch, plus the spec file itself). Anything else belongs to a different commit.
