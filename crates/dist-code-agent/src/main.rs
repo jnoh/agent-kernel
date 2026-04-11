@@ -226,27 +226,8 @@ struct DaemonConnection {
     reader: BufReader<UnixStream>,
 }
 
-fn connect_and_setup(
-    socket_path: &std::path::Path,
-    workspace: &std::path::Path,
-    local_tools: &[Box<dyn kernel_interfaces::tool::ToolRegistration>],
-) -> DaemonConnection {
-    let stream = UnixStream::connect(socket_path).unwrap_or_else(|e| {
-        eprintln!("Failed to connect to {}: {e}", socket_path.display());
-        std::process::exit(1);
-    });
-
-    let write_stream = stream.try_clone().expect("clone stream");
-    let read_stream = stream;
-
-    let writer = std::sync::Arc::new(std::sync::Mutex::new(BufWriter::new(write_stream)));
-
-    let tool_schemas: Vec<_> = local_tools
-        .iter()
-        .map(|t| tools::to_schema(t.as_ref()))
-        .collect();
-
-    let policy = kernel_interfaces::policy::Policy {
+fn default_policy() -> kernel_interfaces::policy::Policy {
+    kernel_interfaces::policy::Policy {
         version: 1,
         name: "default-permissive".into(),
         rules: vec![
@@ -266,7 +247,45 @@ fn connect_and_setup(
             },
         ],
         resource_budgets: None,
-    };
+    }
+}
+
+/// Prepend an `Allow` rule for the given capabilities to the policy's rule
+/// list. First-match-wins evaluation means the new rule shadows any later
+/// `Ask` or `Deny` that would otherwise match the same capability.
+fn prepend_allow_rule(policy: &mut kernel_interfaces::policy::Policy, capabilities: Vec<String>) {
+    policy.rules.insert(
+        0,
+        kernel_interfaces::policy::PolicyRule {
+            match_capabilities: capabilities,
+            action: kernel_interfaces::policy::PolicyAction::Allow,
+            scope_paths: Vec::new(),
+            scope_commands: Vec::new(),
+            except: Vec::new(),
+        },
+    );
+}
+
+fn connect_and_setup(
+    socket_path: &std::path::Path,
+    workspace: &std::path::Path,
+    local_tools: &[Box<dyn kernel_interfaces::tool::ToolRegistration>],
+    policy: kernel_interfaces::policy::Policy,
+) -> DaemonConnection {
+    let stream = UnixStream::connect(socket_path).unwrap_or_else(|e| {
+        eprintln!("Failed to connect to {}: {e}", socket_path.display());
+        std::process::exit(1);
+    });
+
+    let write_stream = stream.try_clone().expect("clone stream");
+    let read_stream = stream;
+
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(BufWriter::new(write_stream)));
+
+    let tool_schemas: Vec<_> = local_tools
+        .iter()
+        .map(|t| tools::to_schema(t.as_ref()))
+        .collect();
 
     let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
 
@@ -309,7 +328,8 @@ fn connect_and_setup(
 
 fn run_tui(socket_path: &std::path::Path, workspace: &std::path::Path) {
     let local_tools = tools::create_tools(workspace);
-    let conn = connect_and_setup(socket_path, workspace, &local_tools);
+    let mut current_policy = default_policy();
+    let conn = connect_and_setup(socket_path, workspace, &local_tools, current_policy.clone());
     let writer = conn.writer;
 
     // Channel: reader thread sends KernelEvents to the TUI main loop
@@ -407,7 +427,13 @@ fn run_tui(socket_path: &std::path::Path, workspace: &std::path::Path) {
     }
 
     // Main TUI event loop
-    let result = run_tui_loop(&mut terminal, &mut app, &event_rx, &writer);
+    let result = run_tui_loop(
+        &mut terminal,
+        &mut app,
+        &event_rx,
+        &writer,
+        &mut current_policy,
+    );
 
     // Shutdown
     {
@@ -429,6 +455,7 @@ fn run_tui_loop(
     app: &mut tui::App,
     event_rx: &mpsc::Receiver<KernelEvent>,
     writer: &std::sync::Arc<std::sync::Mutex<BufWriter<UnixStream>>>,
+    current_policy: &mut kernel_interfaces::policy::Policy,
 ) -> io::Result<()> {
     loop {
         // Only redraw when something changed
@@ -481,6 +508,7 @@ fn run_tui_loop(
                         });
 
                         app.awaiting_permission = false;
+                        app.pending_permission_capabilities = None;
 
                         let mut w = writer.lock().unwrap();
                         let _ = write_message(
@@ -488,6 +516,39 @@ fn run_tui_loop(
                             &KernelRequest::PermissionResponse {
                                 request_id: kernel_interfaces::protocol::RequestId(req_id),
                                 decision,
+                            },
+                        );
+                    }
+                }
+                tui::InputAction::PermissionAlwaysAllow => {
+                    if let (Some(req_id), Some(capabilities)) = (
+                        app.pending_permission_request_id.take(),
+                        app.pending_permission_capabilities.take(),
+                    ) {
+                        // Promote these capabilities to an auto-allow rule
+                        // for the rest of the session.
+                        prepend_allow_rule(current_policy, capabilities);
+
+                        // Remove the permission prompt entry
+                        app.entries.retain(|e| {
+                            !matches!(e, tui::ConversationEntry::PermissionPrompt { .. })
+                        });
+
+                        app.awaiting_permission = false;
+
+                        let mut w = writer.lock().unwrap();
+                        let _ = write_message(
+                            &mut *w,
+                            &KernelRequest::SetPolicy {
+                                session_id: kernel_interfaces::types::SessionId(0),
+                                policy: current_policy.clone(),
+                            },
+                        );
+                        let _ = write_message(
+                            &mut *w,
+                            &KernelRequest::PermissionResponse {
+                                request_id: kernel_interfaces::protocol::RequestId(req_id),
+                                decision: Decision::Allow,
                             },
                         );
                     }
@@ -638,6 +699,7 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
         } => {
             app.awaiting_permission = true;
             app.pending_permission_request_id = Some(request_id.0);
+            app.pending_permission_capabilities = Some(request.capabilities.clone());
             app.entries.push(tui::ConversationEntry::PermissionPrompt {
                 tool_name: request.tool_name.clone(),
                 capabilities: request.capabilities.clone(),
@@ -706,7 +768,7 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
 fn run_repl(socket_path: &std::path::Path, workspace: &std::path::Path) {
     let local_tools = tools::create_tools(workspace);
     let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
-    let conn = connect_and_setup(socket_path, workspace, &local_tools);
+    let conn = connect_and_setup(socket_path, workspace, &local_tools, default_policy());
     let writer = conn.writer;
 
     eprintln!("agent-kernel v0.1.0 — code-agent distribution (IPC client)");
@@ -892,4 +954,65 @@ fn run_repl(socket_path: &std::path::Path, workspace: &std::path::Path) {
 
     let _ = reader_handle.join();
     eprintln!("\nGoodbye.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel_interfaces::policy::{Policy, PolicyAction, PolicyRule};
+    use kernel_interfaces::types::{Capability, Decision};
+
+    fn policy_asking_shell() -> Policy {
+        Policy {
+            version: 1,
+            name: "test".into(),
+            rules: vec![PolicyRule {
+                match_capabilities: vec!["shell:exec".into()],
+                action: PolicyAction::Ask,
+                scope_paths: Vec::new(),
+                scope_commands: Vec::new(),
+                except: Vec::new(),
+            }],
+            resource_budgets: None,
+        }
+    }
+
+    #[test]
+    fn prepend_allow_rule_shadows_later_ask() {
+        let mut policy = policy_asking_shell();
+        // Baseline: the untouched policy asks for shell:exec.
+        assert_eq!(
+            policy.evaluate(&Capability::new("shell:exec")),
+            Decision::Ask
+        );
+
+        prepend_allow_rule(&mut policy, vec!["shell:exec".into()]);
+
+        // After prepend, first-match-wins turns shell:exec into Allow.
+        assert_eq!(
+            policy.evaluate(&Capability::new("shell:exec")),
+            Decision::Allow
+        );
+        // The new rule sits at index 0.
+        assert_eq!(policy.rules.len(), 2);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert_eq!(policy.rules[0].match_capabilities, vec!["shell:exec"]);
+    }
+
+    #[test]
+    fn prepend_allow_rule_preserves_other_capabilities() {
+        let mut policy = policy_asking_shell();
+        prepend_allow_rule(&mut policy, vec!["net:api.github.com".into()]);
+
+        // shell:exec unchanged — still asks.
+        assert_eq!(
+            policy.evaluate(&Capability::new("shell:exec")),
+            Decision::Ask
+        );
+        // The newly-allowed capability is allowed.
+        assert_eq!(
+            policy.evaluate(&Capability::new("net:api.github.com")),
+            Decision::Allow
+        );
+    }
 }

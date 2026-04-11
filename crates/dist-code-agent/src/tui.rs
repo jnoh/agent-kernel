@@ -159,6 +159,10 @@ pub struct App {
     pub awaiting_permission: bool,
     /// The request_id of the pending permission (if any).
     pub pending_permission_request_id: Option<u64>,
+    /// Capabilities of the pending permission request. Stashed at prompt
+    /// time so the `a` ("always allow") dispatch can promote them to a
+    /// new policy rule without re-parsing the ConversationEntry.
+    pub pending_permission_capabilities: Option<Vec<String>>,
 
     // --- Input history ---
     /// Past submitted inputs (oldest first).
@@ -191,6 +195,7 @@ impl App {
             spinner_tick: 0,
             awaiting_permission: false,
             pending_permission_request_id: None,
+            pending_permission_capabilities: None,
             history: Vec::new(),
             history_index: None,
             history_stash: String::new(),
@@ -627,7 +632,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        "[y/n]",
+                        "[y/n/a]",
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
@@ -783,6 +788,10 @@ pub enum InputAction {
     SlashCommand(SlashCommand),
     /// User pressed y/n for a permission prompt.
     PermissionDecision(bool),
+    /// User pressed `a` — allow the pending tool call AND hot-swap the
+    /// session policy so the same capabilities auto-allow for the rest
+    /// of the session.
+    PermissionAlwaysAllow,
     /// User wants to cancel the current turn (Ctrl+C / Esc while turn active).
     Cancel,
     /// User wants to quit (Ctrl+C when idle, or /quit).
@@ -824,7 +833,7 @@ pub fn parse_slash_command(text: &str) -> Option<SlashCommand> {
 /// Process a crossterm key event, mutate App state, and return any action
 /// that the main loop needs to handle.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
-    // --- Permission mode: only y/n ---
+    // --- Permission mode: only y/n/a ---
     if app.awaiting_permission {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -832,6 +841,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 return InputAction::PermissionDecision(false);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                return InputAction::PermissionAlwaysAllow;
             }
             _ => return InputAction::None,
         }
@@ -1171,5 +1183,54 @@ mod tests {
     #[test]
     fn parse_trims_whitespace() {
         assert_eq!(parse_slash_command("  /clear  "), Some(SlashCommand::Clear));
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn permission_mode_a_returns_always_allow() {
+        let mut app = App::new();
+        app.awaiting_permission = true;
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Char('a'))),
+            InputAction::PermissionAlwaysAllow
+        ));
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Char('A'))),
+            InputAction::PermissionAlwaysAllow
+        ));
+    }
+
+    #[test]
+    fn permission_mode_y_and_n_unchanged() {
+        let mut app = App::new();
+        app.awaiting_permission = true;
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Char('y'))),
+            InputAction::PermissionDecision(true)
+        ));
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Char('Y'))),
+            InputAction::PermissionDecision(true)
+        ));
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Char('n'))),
+            InputAction::PermissionDecision(false)
+        ));
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Char('N'))),
+            InputAction::PermissionDecision(false)
+        ));
+    }
+
+    #[test]
+    fn non_permission_mode_a_is_plain_input() {
+        let mut app = App::new();
+        assert!(!app.awaiting_permission);
+        let action = handle_key(&mut app, key(KeyCode::Char('a')));
+        assert!(matches!(action, InputAction::None));
+        assert_eq!(app.input, "a");
     }
 }
