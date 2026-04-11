@@ -18,10 +18,8 @@ Current state: ratatui TUI with markdown rendering, input history, multiline inp
 - Daemon reconnection support
 - Duplicate tool call fix
 - Slash commands (`/clear`, `/compact`, `/status`, `/quit`)
+- Permission "always allow" (`a` key during prompt)
 
 ## Open
 
-### G2. Permission "always allow" — [ ]
-- `a` key during permission prompt = always allow this tool for the session
-- Updates policy via `SetPolicy` message to daemon
-- Scope: `handle_key` permission mode, policy construction
+_(none — next roadmap items TBD)_
