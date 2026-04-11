@@ -145,7 +145,7 @@ impl EventLoop {
                     SessionControl::set_policy(&mut self.session, policy);
                 }
                 KernelRequest::RequestCompaction { .. } => {
-                    match self.session.request_compaction() {
+                    match self.session.request_compaction(&*self.provider) {
                         Ok(freed) => {
                             let _ = self.output_tx.send(KernelEvent::CompactionHappened {
                                 session_id: self.session_id,

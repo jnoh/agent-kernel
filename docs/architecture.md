@@ -635,8 +635,9 @@ trait SessionControl: Send {
     // --- Commands ---
     /// Signal cancellation — the turn loop stops dispatching tools.
     fn cancel(&self);
-    /// Force context compaction. Returns tokens freed.
-    fn request_compaction(&mut self) -> Result<usize, String>;
+    /// Force context compaction. Returns tokens freed. Takes a provider
+    /// because compaction calls the model to generate real summaries.
+    fn request_compaction(&mut self, provider: &dyn ProviderInterface) -> Result<usize, String>;
     /// Hot-swap the active policy.
     fn set_policy(&mut self, policy: Policy);
 }

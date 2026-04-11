@@ -138,7 +138,7 @@ impl TurnLoop {
 
         // Check if compaction is needed before assembling prompt
         if context.should_compact() {
-            match context.compact() {
+            match context.compact(provider) {
                 Ok(freed) => {
                     frontend.on_compaction(&kernel_interfaces::frontend::CompactionSummary {
                         turns_before: context.turn_count(),

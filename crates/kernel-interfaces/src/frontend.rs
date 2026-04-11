@@ -1,3 +1,4 @@
+use crate::provider::ProviderInterface;
 use crate::tool::ToolOutput;
 use crate::types::{Decision, StreamChunk, TurnId};
 use serde::{Deserialize, Serialize};
@@ -71,8 +72,10 @@ pub trait SessionControl: Send {
     // --- Commands ---
     /// Signal cancellation — the turn loop should stop dispatching tools.
     fn cancel(&self);
-    /// Force context compaction. Returns tokens freed.
-    fn request_compaction(&mut self) -> Result<usize, String>;
+    /// Force context compaction. Returns tokens freed. Requires a provider
+    /// because spec 0004 replaced the truncation stub with a real
+    /// provider-backed summary call.
+    fn request_compaction(&mut self, provider: &dyn ProviderInterface) -> Result<usize, String>;
     /// Hot-swap the active policy.
     fn set_policy(&mut self, policy: crate::policy::Policy);
 }

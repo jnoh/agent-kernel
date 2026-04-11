@@ -1,7 +1,8 @@
 use crate::context_store::{ContextStore, InMemoryContextStore};
 use crate::session_events::{NullSink, SessionEvent, SessionEventSink, now_millis};
+use kernel_interfaces::provider::ProviderInterface;
 use kernel_interfaces::tool::ToolRegistration;
-use kernel_interfaces::types::{Content, Invalidation, Message, Prompt, Role};
+use kernel_interfaces::types::{CompletionConfig, Content, Invalidation, Message, Prompt, Role};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -457,9 +458,13 @@ impl ContextManager {
         }
     }
 
-    /// Run compaction — summarize older turns to free token budget.
-    /// Returns the number of tokens freed, or an error message.
-    pub fn compact(&mut self) -> Result<usize, String> {
+    /// Run compaction — summarize older turns to free token budget by
+    /// calling the provider for a real summary.
+    ///
+    /// This is a projection operation on the in-memory view. The Tier-3
+    /// `SessionEventSink` is untouched — the original turns are preserved
+    /// in the event stream and can be re-derived at any point.
+    pub fn compact(&mut self, provider: &dyn ProviderInterface) -> Result<usize, String> {
         // Death spiral guard: cooldown check
         if let Some(last) = self.last_compaction_time
             && last.elapsed().as_secs() < self.config.compaction_cooldown_secs
@@ -493,27 +498,32 @@ impl ContextManager {
 
         let mut tokens_freed = 0;
 
-        // Summarize turns in the compaction zone that haven't been summarized yet
-        for turn in &mut self.store.turns_mut()[..compact_up_to] {
-            if !turn.summarized {
+        // Summarize turns in the compaction zone that haven't been summarized yet.
+        // Collect indices first to avoid holding a mutable borrow across the
+        // provider call.
+        let indices_to_compact: Vec<usize> = (0..compact_up_to)
+            .filter(|&i| !self.store.turns()[i].summarized)
+            .collect();
+
+        for i in indices_to_compact {
+            let (original_tokens, summary) = {
+                let turn = &self.store.turns()[i];
                 let original_tokens = turn.token_estimate;
-
-                // Generate a summary — in production this would call the model.
-                // For now, we truncate to a short summary.
-                let summary = summarize_turn(turn);
-                let summary_tokens = estimate_tokens(&summary);
-
-                turn.input = Message {
-                    role: turn.input.role,
-                    content: vec![Content::Text(summary)],
-                };
-                turn.response = None;
-                turn.tool_exchanges.clear();
-                turn.token_estimate = summary_tokens;
-                turn.summarized = true;
-
-                tokens_freed += original_tokens.saturating_sub(summary_tokens);
-            }
+                let summary = summarize_turn_with_provider(turn, provider)?;
+                (original_tokens, summary)
+            };
+            let summary_tokens = estimate_tokens(&summary);
+            let role = self.store.turns()[i].input.role;
+            let turn = &mut self.store.turns_mut()[i];
+            turn.input = Message {
+                role,
+                content: vec![Content::Text(summary)],
+            };
+            turn.response = None;
+            turn.tool_exchanges.clear();
+            turn.token_estimate = summary_tokens;
+            turn.summarized = true;
+            tokens_freed += original_tokens.saturating_sub(summary_tokens);
         }
 
         self.tokens_used = self.tokens_used.saturating_sub(tokens_freed);
@@ -530,39 +540,100 @@ fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
-/// Produce a brief summary of a turn.
-/// In production, this would call the model for an actual summary.
-fn summarize_turn(turn: &Turn) -> String {
-    let input_preview: String = turn
+/// Format a turn as prose for the summarization prompt. Captures the
+/// user input, the assistant response (if any), and the tool exchanges.
+fn turn_to_prose(turn: &Turn) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+
+    let role_label = match turn.input.role {
+        Role::User => "User",
+        Role::Assistant => "Assistant",
+        Role::System => "System",
+    };
+    let input_text: String = turn
         .input
         .content
         .iter()
         .filter_map(|c| match c {
-            Content::Text(t) => Some(t.chars().take(100).collect::<String>()),
+            Content::Text(t) => Some(t.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let _ = writeln!(s, "{role_label}: {input_text}");
 
-    let tool_summary = if turn.tool_exchanges.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " [tools: {}]",
-            turn.tool_exchanges
-                .iter()
-                .map(|e| e.tool_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+    if let Some(ref response) = turn.response {
+        let response_text: String = response
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !response_text.trim().is_empty() {
+            let _ = writeln!(s, "Assistant: {response_text}");
+        }
+    }
+
+    for exchange in &turn.tool_exchanges {
+        let _ = writeln!(
+            s,
+            "Tool call: {} input={} result={}",
+            exchange.tool_name, exchange.input, exchange.result
+        );
+    }
+
+    s
+}
+
+/// Call the provider to produce a real summary of a turn. The summary
+/// preserves key facts and decisions while dropping incidental detail.
+fn summarize_turn_with_provider(
+    turn: &Turn,
+    provider: &dyn ProviderInterface,
+) -> Result<String, String> {
+    let prose = turn_to_prose(turn);
+    let system = "You are a concise compaction assistant. Summarize the \
+        following single conversation turn in 2-3 sentences. Preserve \
+        concrete facts (file paths, function names, decisions, errors) \
+        and drop incidental detail. Do not add information that is not \
+        present. Output only the summary text."
+        .to_string();
+    let prompt = Prompt {
+        system,
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![Content::Text(prose)],
+        }],
+        tool_definitions: Vec::new(),
     };
-
-    format!("[summary] {}{}", input_preview, tool_summary)
+    let config = CompletionConfig::default();
+    let response = provider
+        .complete(&prompt, &config)
+        .map_err(|e| format!("summary provider call failed: {e}"))?;
+    let text: String = response
+        .content
+        .into_iter()
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(t),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("provider returned empty summary".into());
+    }
+    Ok(format!("[summary] {trimmed}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel_interfaces::provider::{ProviderCaps, ProviderError, Response, StopReason, Usage};
     use std::sync::{Arc, Mutex};
 
     fn test_config() -> ContextConfig {
@@ -571,6 +642,43 @@ mod tests {
             compaction_threshold: 0.65,
             compaction_cooldown_secs: 0, // no cooldown in tests
             ..Default::default()
+        }
+    }
+
+    /// Minimal fake provider local to this test module. Returns a fixed
+    /// summary text for any completion call. Can't depend on testutil
+    /// from inside a `#[cfg(test)] mod tests` block that's compiled as
+    /// part of the same crate because testutil is a sibling module — but
+    /// a three-method fake is cheap.
+    struct StubProvider {
+        summary: String,
+    }
+
+    impl StubProvider {
+        fn new(summary: &str) -> Self {
+            Self {
+                summary: summary.into(),
+            }
+        }
+    }
+
+    impl ProviderInterface for StubProvider {
+        fn complete(
+            &self,
+            _prompt: &Prompt,
+            _config: &CompletionConfig,
+        ) -> Result<Response, ProviderError> {
+            Ok(Response {
+                content: vec![Content::Text(self.summary.clone())],
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            })
+        }
+        fn count_tokens(&self, _content: &Content) -> usize {
+            10
+        }
+        fn capabilities(&self) -> ProviderCaps {
+            ProviderCaps::default()
         }
     }
 
@@ -655,7 +763,8 @@ mod tests {
             ));
         }
         let before = captured.lock().unwrap().clone();
-        cm.compact().expect("compaction should succeed");
+        cm.compact(&StubProvider::new("Summary."))
+            .expect("compaction should succeed");
         let after = captured.lock().unwrap().clone();
 
         assert_eq!(
@@ -674,7 +783,8 @@ mod tests {
             ));
         }
         let bytes_before = std::fs::read(&log_path).expect("read before");
-        cm2.compact().expect("compaction should succeed");
+        cm2.compact(&StubProvider::new("Summary."))
+            .expect("compaction should succeed");
         let bytes_after = std::fs::read(&log_path).expect("read after");
         assert_eq!(
             bytes_before, bytes_after,
@@ -752,7 +862,9 @@ mod tests {
         }
 
         let before = cm.tokens_used();
-        let freed = cm.compact().expect("compaction should succeed");
+        let freed = cm
+            .compact(&StubProvider::new("Summary."))
+            .expect("compaction should succeed");
 
         assert!(freed > 0, "should free some tokens");
         assert!(cm.tokens_used() < before, "token usage should decrease");
@@ -773,7 +885,8 @@ mod tests {
             cm.append_user_input(format!("Turn {}", i));
         }
 
-        cm.compact().expect("compaction should succeed");
+        cm.compact(&StubProvider::new("Summary."))
+            .expect("compaction should succeed");
 
         // Last ~30% of turns should NOT be summarized
         let tail_count = (10.0_f64 * 0.30).ceil() as usize; // 3
@@ -796,11 +909,11 @@ mod tests {
         cm.append_user_input("Solo turn".into());
 
         for _ in 0..3 {
-            assert!(cm.compact().is_err());
+            assert!(cm.compact(&StubProvider::new("Summary.")).is_err());
         }
 
         // After 3 failures, should be halted
-        let result = cm.compact();
+        let result = cm.compact(&StubProvider::new("Summary."));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("halted"));
     }
@@ -829,11 +942,54 @@ mod tests {
             cm.append_assistant_response(format!("Response {}", i));
         }
 
-        cm.compact().expect("compaction should succeed");
+        cm.compact(&StubProvider::new("Summary."))
+            .expect("compaction should succeed");
 
         assert_eq!(cm.scratchpad().constraints.len(), 1);
         assert_eq!(cm.scratchpad().constraints[0], "Don't modify auth module");
         assert_eq!(cm.scratchpad().plan.len(), 1);
+    }
+
+    #[test]
+    fn compact_uses_provider_for_summary() {
+        // The compacted turn's input should contain whatever the provider
+        // returns, proving the stub was called (not a truncation path).
+        let config = ContextConfig {
+            context_window: 1000,
+            compaction_threshold: 0.10,
+            verbatim_tail_ratio: 0.30,
+            compaction_cooldown_secs: 0,
+            ..Default::default()
+        };
+        let mut cm = ContextManager::new(config, "sys".into());
+        for i in 0..10 {
+            cm.append_user_input(format!(
+                "Turn {i} with enough text to register as non-trivial tokens and trigger the compaction window."
+            ));
+            cm.append_assistant_response(format!("Response {i}."));
+        }
+
+        let sentinel = "UNIQUE_PROVIDER_MARKER_42";
+        cm.compact(&StubProvider::new(sentinel))
+            .expect("compaction should succeed");
+
+        // At least one turn in the compacted head must contain the
+        // sentinel inside its `input` content.
+        let turns = cm.store.turns();
+        let head_len = turns
+            .len()
+            .saturating_sub(((turns.len() as f64) * 0.30).ceil() as usize);
+        let compacted_slice = &turns[..head_len];
+        let any_has_sentinel = compacted_slice.iter().any(|t| {
+            t.input
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::Text(s) if s.contains(sentinel)))
+        });
+        assert!(
+            any_has_sentinel,
+            "expected at least one compacted turn to contain the provider's sentinel summary"
+        );
     }
 
     #[test]

@@ -482,21 +482,25 @@ fn e2e_compaction_triggers() {
 
     let frontend = RecordingFrontend::auto_allow();
 
-    // Fill context with enough turns to trigger compaction
+    // Fill context with enough turns to trigger compaction.
+    // Use FakeProvider (unlimited responses) rather than ScriptedProvider —
+    // projection-based compaction (spec 0004) makes the turn loop call the
+    // provider for every compaction pass, which would exhaust a single-
+    // response script on the first iteration.
+    let provider = FakeProvider {
+        response: Response {
+            content: vec![Content::Text(
+                "Acknowledged, here is a reasonably long response to consume tokens.".into(),
+            )],
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        },
+    };
     for i in 0..15 {
         session.add_user_input(format!(
             "This is message number {} with enough text to consume tokens in the context window",
             i
         ));
-
-        let provider = ScriptedProvider::new(vec![Response {
-            content: vec![Content::Text(format!(
-                "Acknowledged message {}, here is a reasonably long response to consume tokens",
-                i
-            ))],
-            usage: Usage::default(),
-            stop_reason: StopReason::EndTurn,
-        }]);
 
         // Some turns may fail compaction if the death spiral guard triggers,
         // but at least some should succeed.

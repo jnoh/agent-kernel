@@ -79,8 +79,8 @@ impl kernel_interfaces::frontend::SessionControl for Session {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    fn request_compaction(&mut self) -> Result<usize, String> {
-        self.context.compact()
+    fn request_compaction(&mut self, provider: &dyn ProviderInterface) -> Result<usize, String> {
+        self.context.compact(provider)
     }
 
     fn set_policy(&mut self, policy: Policy) {
@@ -546,8 +546,15 @@ mod tests {
         }
 
         let before = SessionControl::tokens_used(session);
+        let summary_provider = FakeProvider {
+            response: Response {
+                content: vec![Content::Text("Summary of earlier turn.".into())],
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            },
+        };
         let freed = session
-            .request_compaction()
+            .request_compaction(&summary_provider)
             .expect("compaction should succeed");
         assert!(freed > 0);
         assert!(SessionControl::tokens_used(session) < before);

@@ -113,10 +113,10 @@ The kernel is explicitly designed around the assumption that **agent sessions ru
 | Scratchpad (Tier 1) | Convenience | Institutional memory |
 | Pending results | Queue | Event loop |
 
-### Current gap
-The current compaction implementation (`context.rs: summarize_turn()`) truncates turn content to ~100 characters without calling the model. This is data destruction, not summarization. For long-running sessions, this means compaction actively degrades the session's understanding.
+### Status
+Resolved by spec 0004. `ContextManager::compact()` now takes a `&dyn ProviderInterface` and calls `provider.complete(...)` with a hard-coded compaction prompt to produce a real 2-3 sentence summary per turn, preserving concrete facts and dropping incidental detail. The old 100-char `summarize_turn()` truncation stub is gone. Compaction is a projection over the in-memory view — the Tier-3 event stream (spec 0003) is untouched, so the authoritative history remains byte-for-byte intact and can be re-derived later (replay/hydration is spec 0005's concern).
 
-**Before structural compaction (§5) is viable**, the kernel needs model-based summarization for leaf-node sessions: call the model to produce a real summary of compacted turns, preserving key facts and decisions. One level of model-based summarization on focused context is acceptable — the pathology is compounding chains of re-summarization, which the session tree structure eliminates.
+One level of model-based summarization on focused context is acceptable — the pathology is compounding chains of re-summarization, which the session tree structure (§5) eliminates.
 
 ---
 
