@@ -1,8 +1,8 @@
-# TUI Roadmap
+# Roadmap
 
 Current state: ratatui TUI with markdown rendering, input history, multiline input, tool call boxes with spinners and inline results, timestamps, token budget, and theme support.
 
-## Completed
+## TUI — Completed
 
 - Markdown rendering (pulldown-cmark)
 - Input history (Up/Down) and multiline input (Shift+Enter)
@@ -20,6 +20,6 @@ Current state: ratatui TUI with markdown rendering, input history, multiline inp
 - Slash commands (`/clear`, `/compact`, `/status`, `/quit`)
 - Permission "always allow" (`a` key during prompt)
 
-## Open
+## TUI — Open
 
 _(none — next roadmap items TBD)_

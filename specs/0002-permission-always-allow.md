@@ -21,7 +21,7 @@ Add an `a` key to the TUI permission prompt that allows the pending tool call **
 - `crates/kernel-interfaces/src/frontend.rs:14-20` — `PermissionRequest { tool_name, capabilities: Vec<String>, input_summary }` — `capabilities` is what "always allow" promotes to a new `Allow` rule
 - `crates/kernel-interfaces/src/policy.rs:1-71` — `Policy`, `PolicyRule`, `PolicyAction`, `Policy::evaluate` (first-match-wins, so a prepended `Allow` rule for specific capabilities shadows existing `Ask` rules)
 - `crates/kernel-core/src/permission.rs:19` and `crates/kernel-core/src/session.rs:85-86,182-183` — verifies `set_policy` is wired through session → permission evaluator (no kernel-side changes required)
-- `docs/tui-roadmap.md:22-29` — original G2 roadmap entry
+- `docs/roadmap.md` — original G2 roadmap entry (file previously named `docs/tui-roadmap.md`)
 - `specs/0001-slash-commands.md` — prior spec in the same TUI area; shows conventions for tui.rs / main.rs work, especially the "parser + unit test" pattern
 
 ## Acceptance criteria
@@ -47,7 +47,7 @@ Add an `a` key to the TUI permission prompt that allows the pending tool call **
 - A separate "always deny" key
 - Changing default policy construction in `main.rs:249-269` beyond what's needed to keep a mutable copy around
 - Kernel-side changes to `permission.rs`, `session.rs`, or `event_loop.rs` — `SetPolicy` is already wired end-to-end
-- Marking G2 done in `docs/tui-roadmap.md` as a code change (do it as part of the commit, same pattern as spec 0001)
+- Marking G2 done in `docs/roadmap.md` (then named `tui-roadmap.md`) as a code change (do it as part of the commit, same pattern as spec 0001)
 - A `/help` or discoverability affordance for the new `a` key beyond the `[y/n/a]` footer
 
 ## Checkpoints

@@ -16,7 +16,7 @@ Add `/clear`, `/compact`, and `/status` slash commands to the TUI input bar, alo
 - `crates/kernel-interfaces/src/protocol.rs:96` — `KernelRequest::RequestCompaction { session_id }`
 - `crates/kernel-interfaces/src/protocol.rs:105` — `KernelRequest::QuerySession { session_id }`
 - `crates/kernel-interfaces/src/protocol.rs:167-173` — `KernelEvent::SessionStatus { tokens_used, utilization, turn_count }` (the response shape `/status` should render)
-- `docs/tui-roadmap.md:23-29` — original G1 roadmap entry
+- `docs/roadmap.md` — original G1 roadmap entry (file previously named `docs/tui-roadmap.md`)
 
 ## Acceptance criteria
 - [ ] `cargo fmt -- --check && cargo clippy && cargo test` passes
@@ -35,7 +35,7 @@ Add `/clear`, `/compact`, and `/status` slash commands to the TUI input bar, alo
 - Any new `KernelRequest` or `KernelEvent` variants — only existing protocol surface is used
 - Refactoring unrelated parts of `handle_key` or the main-loop dispatch
 - G2 ("always allow" permission key) — separate roadmap item, separate spec
-- Updating `docs/tui-roadmap.md` to mark G1 done (do as part of the commit, not as a code change)
+- Updating `docs/roadmap.md` (then named `tui-roadmap.md`) to mark G1 done (do as part of the commit, not as a code change)
 
 ## Checkpoints
 - **After reading context, before writing code**: post a 5-line plan and wait for go/no-go (default first checkpoint)
