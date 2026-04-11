@@ -84,6 +84,61 @@ cargo fmt -- --check && cargo clippy && cargo test
 
 This project is built semi-autonomously from scoped specs in `specs/`. When the user describes a unit of work or points you at a file in `specs/`, follow `docs/spec-protocol.md` — it covers both authoring new specs (from `specs/_template.md`) and executing existing ones.
 
+### Sync docs/ after every spec completion
+
+When a spec flips to `done`, the system's reality has changed and `docs/` may have drifted. Before the final commit, invoke a doc-sync subagent to find and fix any drift. Delegate this to a subagent (via the `Agent` tool, `subagent_type: "general-purpose"`) rather than doing it in the main conversation — a doc scan pulls in hundreds of lines of architecture prose that would pollute the executing Claude's context, and the judgment "is this sentence still true?" benefits from a cold reader who hasn't been immersed in the implementation.
+
+**Invoke with this exact prompt, substituting `{SPEC_PATH}`:**
+
+```
+You are a documentation-sync reviewer. A spec just moved to `done` and you
+need to find and fix any resulting drift in docs/.
+
+Inputs:
+- Completed spec: {SPEC_PATH}
+- Docs directory: docs/
+- Diff command: git diff HEAD (the spec's uncommitted changes)
+
+Procedure:
+1. Read the spec file in full, including its Notes section — that's where
+   the execution-time decisions live.
+2. Run the diff command and read the diff.
+3. For each file in docs/ (skipping spec-protocol.md), read it and
+   identify content that is now stale. Typical drift:
+     - Roadmap items not crossed off
+     - Code snippets that no longer match the implementation
+     - File or symbol paths that were renamed
+     - Features described as "missing" or "deferred" that now exist
+     - Features described as present that were removed
+     - "What v0.1 defers" entries that no longer defer
+4. Apply edits directly using the Edit tool. Do not ask for approval —
+   you are operating in edit mode. Be conservative: touch only lines
+   that are actually stale. Do not rewrite unchanged content, do not
+   restructure, do not add new sections unless the spec explicitly
+   removed a concept that needs removal.
+5. If you find something stale but the correct fix is unclear (e.g.,
+   the spec changed something partially and docs need a judgment call),
+   leave the file alone and flag it in your final report.
+6. If nothing needs updating, report "no drift found" and stop.
+
+Report format (under 200 words, no preamble):
+- Files touched: [list, or "none"]
+- What changed: [one bullet per edit, citing file:line]
+- Flagged (unclear fix): [one bullet per item, or "none"]
+
+Constraints:
+- Do not edit specs/, CLAUDE.md, crates/, or spec-protocol.md — only
+  the rest of docs/.
+- Do not propose new documentation; only maintain existing text.
+- Do not run `cargo` commands — you're checking docs against code by
+  reading, not building.
+```
+
+**Handling the report:**
+- **"no drift found"** → proceed to commit without doc changes.
+- **Edits made** → stage them alongside the spec's code changes and include in the same commit. The spec completion and its doc sync ship together.
+- **Flagged items** → surface each to the user before committing. Do not silently skip them. The user decides whether to fix the doc, amend the spec, or punt.
+
 ## Commit hygiene
 
 - **One commit per logical concern.** If the working tree contains work from two unrelated concerns, split them — commit the foundational or older one first, then the new one. Bundling unrelated work makes future bisects, reverts, and history reading harder.
