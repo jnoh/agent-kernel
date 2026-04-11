@@ -777,3 +777,98 @@ fn e2e_session_events_written_to_file() {
         "expected AssistantResponse event"
     );
 }
+
+/// Round-trip: write a session's events to a file, hydrate a fresh
+/// session from that file, assert the hydrated view matches the original.
+#[test]
+fn e2e_hydrate_roundtrip() {
+    use kernel_core::session_events::FileSink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log_path = tmp.path().join("events.jsonl");
+
+    // --- Phase 1: original session writes events ---
+    let sink = FileSink::new(SessionId(0), &log_path).expect("open file sink");
+    let mut mgr = SessionManager::new(ResourceBudget::default());
+    let orig_id = mgr.spawn_interactive_with_events(
+        session_config(allow_all_policy()),
+        Vec::new(),
+        Box::new(sink),
+    );
+
+    let frontend = RecordingFrontend::auto_allow();
+
+    {
+        let session = mgr.get_mut(orig_id).unwrap();
+        session.add_user_input("Say hi".into());
+        let provider = FakeProvider {
+            response: Response {
+                content: vec![Content::Text("Hello!".into())],
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            },
+        };
+        session.run_turn(&provider, &frontend).unwrap();
+    }
+    {
+        let session = mgr.get_mut(orig_id).unwrap();
+        session.add_user_input("And again".into());
+        let provider = FakeProvider {
+            response: Response {
+                content: vec![Content::Text("Hi again!".into())],
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            },
+        };
+        session.run_turn(&provider, &frontend).unwrap();
+    }
+
+    let orig_turn_count = mgr.get(orig_id).unwrap().context().turn_count();
+    // Drop mgr so the FileSink flushes before we read the file back.
+    drop(mgr);
+
+    // --- Phase 2: hydrate a new session from the file ---
+    let mut mgr2 = SessionManager::new(ResourceBudget::default());
+    let hydrated_id = mgr2
+        .hydrate_from_events(
+            &log_path,
+            default_context_config(),
+            CompletionConfig::default(),
+            allow_all_policy(),
+            ResourceBudget::default(),
+            SessionMode::Interactive,
+            PathBuf::from("/tmp/test-workspace"),
+            Vec::new(),
+        )
+        .expect("hydrate should succeed");
+
+    let hydrated = mgr2.get(hydrated_id).unwrap();
+    assert_eq!(
+        hydrated.context().turn_count(),
+        orig_turn_count,
+        "hydrated turn count must match original"
+    );
+
+    // Assert the hydrated session's context contains both user inputs
+    // verbatim. We reach into the context via its assembled prompt, since
+    // context() is read-only and already exposes the view.
+    let prompt = hydrated.context().assemble();
+    let joined: String = prompt
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        joined.contains("Say hi"),
+        "expected 'Say hi' in hydrated view, got: {joined}"
+    );
+    assert!(
+        joined.contains("And again"),
+        "expected 'And again' in hydrated view, got: {joined}"
+    );
+}

@@ -185,6 +185,63 @@ impl ContextManager {
         });
     }
 
+    /// Replay a sequence of `SessionEvent`s into this manager as if they
+    /// had been produced live (spec 0005 — session hydration).
+    ///
+    /// The caller MUST ensure the manager's sink is a `NullSink` (or
+    /// equivalent drop-all sink). Otherwise the replayed events get
+    /// written back to storage, duplicating history. `hydrated_from_events`
+    /// enforces this.
+    ///
+    /// `SessionStarted` events are skipped — the constructor already
+    /// consumed the first one to set `system_prompt`.
+    pub fn replay_events(&mut self, events: &[SessionEvent]) {
+        for event in events {
+            match event {
+                SessionEvent::SessionStarted { .. } => {}
+                SessionEvent::UserInput { text, .. } => {
+                    self.append_user_input(text.clone());
+                }
+                SessionEvent::AssistantResponse { text, .. } => {
+                    self.append_assistant_response(text.clone());
+                }
+                SessionEvent::ToolExchange {
+                    tool_name,
+                    input,
+                    result,
+                    ..
+                } => {
+                    self.append_tool_exchange(tool_name.clone(), input.clone(), result.clone());
+                }
+                SessionEvent::SystemMessage { text, .. } => {
+                    self.append_system_message(text.clone());
+                }
+            }
+        }
+    }
+
+    /// Build a `ContextManager` by replaying a session's event stream.
+    ///
+    /// The first event must be `SessionStarted` — its `system_prompt`
+    /// becomes the manager's system prompt. Subsequent events are replayed
+    /// in order into a fresh view. The resulting manager has a `NullSink`:
+    /// replay must not re-emit events.
+    pub fn hydrated_from_events(
+        config: ContextConfig,
+        events: &[SessionEvent],
+    ) -> Result<Self, String> {
+        let (system_prompt, rest) = match events.split_first() {
+            Some((SessionEvent::SessionStarted { system_prompt, .. }, rest)) => {
+                (system_prompt.clone(), rest)
+            }
+            Some(_) => return Err("first event must be SessionStarted".into()),
+            None => return Err("empty event stream — nothing to hydrate".into()),
+        };
+        let mut cm = Self::with_event_sink(config, system_prompt, Box::new(NullSink::default()));
+        cm.replay_events(rest);
+        Ok(cm)
+    }
+
     /// Current token usage.
     pub fn tokens_used(&self) -> usize {
         self.tokens_used
@@ -948,6 +1005,114 @@ mod tests {
         assert_eq!(cm.scratchpad().constraints.len(), 1);
         assert_eq!(cm.scratchpad().constraints[0], "Don't modify auth module");
         assert_eq!(cm.scratchpad().plan.len(), 1);
+    }
+
+    #[test]
+    fn replay_events_reproduces_view() {
+        // Drive two managers the same way — one via direct append_* calls,
+        // one via replay_events of the equivalent SessionEvent vec — and
+        // assert the final views match.
+        let config = test_config();
+        let mut direct = ContextManager::with_event_sink(
+            config.clone(),
+            "sys".into(),
+            Box::new(NullSink::default()),
+        );
+        direct.append_user_input("hello".into());
+        direct.append_assistant_response("hi".into());
+        direct.append_user_input("what files?".into());
+        direct.append_tool_exchange(
+            "ls".into(),
+            serde_json::json!({"path": "."}),
+            serde_json::json!({"entries": ["a.txt", "b.txt"]}),
+        );
+        direct.append_assistant_response("two files".into());
+
+        let events = vec![
+            SessionEvent::UserInput {
+                timestamp_ms: 0,
+                turn_index: 0,
+                text: "hello".into(),
+            },
+            SessionEvent::AssistantResponse {
+                timestamp_ms: 0,
+                turn_index: 0,
+                text: "hi".into(),
+            },
+            SessionEvent::UserInput {
+                timestamp_ms: 0,
+                turn_index: 1,
+                text: "what files?".into(),
+            },
+            SessionEvent::ToolExchange {
+                timestamp_ms: 0,
+                turn_index: 1,
+                tool_name: "ls".into(),
+                input: serde_json::json!({"path": "."}),
+                result: serde_json::json!({"entries": ["a.txt", "b.txt"]}),
+            },
+            SessionEvent::AssistantResponse {
+                timestamp_ms: 0,
+                turn_index: 1,
+                text: "two files".into(),
+            },
+        ];
+        let mut replayed =
+            ContextManager::with_event_sink(config, "sys".into(), Box::new(NullSink::default()));
+        replayed.replay_events(&events);
+
+        let d_turns = direct.store.turns();
+        let r_turns = replayed.store.turns();
+        assert_eq!(d_turns.len(), r_turns.len());
+        for (d, r) in d_turns.iter().zip(r_turns.iter()) {
+            assert_eq!(d.input.content.len(), r.input.content.len());
+            let d_text: String = d
+                .input
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let r_text: String = r
+                .input
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(d_text, r_text);
+            assert_eq!(d.tool_exchanges.len(), r.tool_exchanges.len());
+        }
+    }
+
+    #[test]
+    fn hydrated_from_events_rejects_missing_session_started() {
+        let config = test_config();
+        let events = vec![SessionEvent::UserInput {
+            timestamp_ms: 0,
+            turn_index: 0,
+            text: "hi".into(),
+        }];
+        match ContextManager::hydrated_from_events(config, &events) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => assert!(
+                e.contains("SessionStarted"),
+                "error should mention SessionStarted: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn hydrated_from_events_rejects_empty_stream() {
+        let config = test_config();
+        match ContextManager::hydrated_from_events(config, &[]) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => assert!(e.contains("empty"), "error should mention empty: {e}"),
+        }
     }
 
     #[test]

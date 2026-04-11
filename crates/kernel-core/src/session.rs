@@ -235,6 +235,56 @@ impl SessionManager {
         id
     }
 
+    /// Hydrate a session from an on-disk event stream (spec 0005).
+    ///
+    /// Reads the JSONL file at `events_path`, extracts the original
+    /// `system_prompt` from the first `SessionStarted` event, replays the
+    /// remaining events into a fresh `ContextManager`, and wires a full
+    /// `Session` around it. The caller provides non-historical config
+    /// (policy, completion config, budget, mode, tools) because those
+    /// aren't currently round-trippable through the event schema.
+    ///
+    /// The hydrated session uses a `NullSink` — post-hydration writes are
+    /// not currently logged. A follow-up spec can add "open new sink at
+    /// hydrate time" if that's needed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hydrate_from_events(
+        &mut self,
+        events_path: &std::path::Path,
+        context_config: ContextConfig,
+        completion_config: kernel_interfaces::types::CompletionConfig,
+        policy: Policy,
+        resource_budget: kernel_interfaces::types::ResourceBudget,
+        mode: kernel_interfaces::types::SessionMode,
+        workspace: std::path::PathBuf,
+        tools: Vec<Box<dyn ToolRegistration>>,
+    ) -> Result<SessionId, String> {
+        let events = crate::session_events::read_events_from_file(events_path)
+            .map_err(|e| format!("failed to read event file: {e}"))?;
+        let context = ContextManager::hydrated_from_events(context_config, &events)?;
+
+        let id = SessionId(self.next_id);
+        self.next_id += 1;
+
+        let permission = PermissionEvaluator::new(policy);
+        let turn_loop = TurnLoop::new(
+            completion_config,
+            resource_budget.max_tool_invocations_per_turn,
+        );
+        let session = Session::new(
+            id,
+            mode,
+            workspace,
+            context,
+            permission,
+            turn_loop,
+            tools,
+            resource_budget.max_tokens_per_session,
+        );
+        self.sessions.push(session);
+        Ok(id)
+    }
+
     /// Spawn an interactive session with a custom event sink. Used by
     /// callers that want authoritative Tier-3 storage (file-backed or
     /// otherwise). The default `spawn_interactive` uses a `NullSink`.

@@ -123,7 +123,12 @@ One level of model-based summarization on focused context is acceptable — the 
 ## 3. Session Checkpointing
 
 ### Problem
-If a session lives for hours/days, it must survive restarts, machine failures, and migration between environments. The current implementation holds all state in memory with no persistence.
+If a session lives for hours/days, it must survive restarts, machine failures, and migration between environments. The original implementation held all state in memory with no persistence.
+
+### Status
+Partially resolved. Spec 0003 added the append-only event stream (`SessionEventSink`, `FileSink`, `events.jsonl`) so every `append_*` on the context manager is durably recorded. Spec 0005 added the read path: `session_events::read_events_from_file`, `ContextManager::replay_events` / `hydrated_from_events`, and `SessionManager::hydrate_from_events`. A session can now be rebuilt in-memory from a local `events.jsonl` by replaying events through the same `append_*` methods that wrote them (a `NullSink` prevents re-emission).
+
+What's still deferred: the full `SessionSnapshot` shape below (scratchpad, tokens_used, compaction state, pending_results, parent/children, tool sources, metadata) is not yet in the event schema — hydration today reconstructs the turn view only, and non-historical config (policy, tools, completion config, resource budget) is caller-provided at hydrate time. Workspace sync and remote/cross-machine hydration are out of scope for spec 0005 (see specs 0007/0008).
 
 ### Proposed Change
 Sessions are serializable to a `SessionSnapshot` and can be checkpointed, stored, and hydrated on demand.

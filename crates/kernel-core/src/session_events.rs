@@ -18,7 +18,7 @@
 use kernel_interfaces::types::SessionId;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -70,6 +70,33 @@ pub enum SessionEvent {
 pub trait SessionEventSink: Send {
     fn session_id(&self) -> SessionId;
     fn record(&mut self, event: SessionEvent);
+}
+
+/// Read a JSONL event file into a vector. Each line is one event.
+///
+/// Fails with `io::ErrorKind::InvalidData` on the first unparseable line,
+/// including the line number in the error message. An empty file returns
+/// `Ok(vec![])`.
+pub fn read_events_from_file(path: impl AsRef<Path>) -> std::io::Result<Vec<SessionEvent>> {
+    let file = File::open(path.as_ref())?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SessionEvent>(&line) {
+            Ok(event) => events.push(event),
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("line {}: {e}", idx + 1),
+                ));
+            }
+        }
+    }
+    Ok(events)
 }
 
 /// Returns the current time as milliseconds since UNIX epoch. Used by
@@ -278,6 +305,51 @@ mod tests {
         });
         // No observable side effect — this test mainly verifies the trait
         // is object-safe and the method signatures compile.
+    }
+
+    #[test]
+    fn read_events_from_file_roundtrips_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let mut sink = FileSink::new(SessionId(0), &path).unwrap();
+        sink.record(sample_user_input(0, "first"));
+        sink.record(SessionEvent::AssistantResponse {
+            timestamp_ms: 0,
+            turn_index: 0,
+            text: "hello".into(),
+        });
+        sink.record(sample_user_input(1, "second"));
+        drop(sink);
+
+        let events = read_events_from_file(&path).expect("read events");
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], SessionEvent::UserInput { ref text, .. } if text == "first"));
+        assert!(
+            matches!(events[1], SessionEvent::AssistantResponse { ref text, .. } if text == "hello")
+        );
+        assert!(matches!(events[2], SessionEvent::UserInput { ref text, .. } if text == "second"));
+    }
+
+    #[test]
+    fn read_events_malformed_line_errors() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"UserInput","timestamp_ms":0,"turn_index":0,"text":"ok"}}"#
+        )
+        .unwrap();
+        writeln!(f, "this is not json").unwrap();
+        drop(f);
+
+        let err = read_events_from_file(&path).expect_err("should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("line 2"),
+            "expected line number in error, got: {err}"
+        );
     }
 
     #[test]
