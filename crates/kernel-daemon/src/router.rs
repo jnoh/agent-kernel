@@ -5,13 +5,12 @@ use crossbeam_channel::Sender;
 use kernel_core::event_loop::{EventLoop, EventLoopConfig};
 use kernel_core::proxy_frontend::ProxyFrontend;
 use kernel_core::proxy_tool::{ProxyTool, ToolResponse};
-use kernel_core::session_events::{FileSink, NullSink, SessionEventSink};
+use kernel_core::session_events::{FileSink, NullSink, SessionEventSink, default_events_path};
 use kernel_interfaces::protocol::{KernelEvent, KernelRequest, ToolSchema};
 use kernel_interfaces::provider::ProviderInterface;
 use kernel_interfaces::tool::ToolRegistration;
 use kernel_interfaces::types::SessionId;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::provider::{AnthropicProvider, EchoProvider};
@@ -105,16 +104,12 @@ impl ConnectionRouter {
                     Duration::from_secs(300), // 5 min for permission decisions
                 );
 
-                // Construct the session-events sink. Log path:
-                // <workspace>/.agent-kernel/session-{id}/events.jsonl.
-                // If the workspace is unusable (e.g., /tmp/test in unit
-                // tests) fall back to a NullSink so the event loop can
-                // still run.
+                // Construct the session-events sink. Path:
+                // $AGENT_KERNEL_HOME or $HOME/.agent-kernel/sessions/{id}/events.jsonl.
+                // If that base dir is unwritable, fall back to a NullSink
+                // so the event loop can still run.
                 let events: Box<dyn SessionEventSink> = {
-                    let log_path = PathBuf::from(&config.workspace)
-                        .join(".agent-kernel")
-                        .join(format!("session-{}", session_id.0))
-                        .join("events.jsonl");
+                    let log_path = default_events_path(session_id);
                     match FileSink::new(session_id, &log_path) {
                         Ok(sink) => Box::new(sink),
                         Err(e) => {

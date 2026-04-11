@@ -207,14 +207,26 @@ The context manager owns the token budget. It is the only subsystem with global 
 │  Budget: managed, evictable              │
 ├─────────────────────────────────────────┤
 │  Tier 3: Long-Term Memory               │
+│  - Session event stream (append-only    │
+│    JSONL, authoritative record)          │
 │  - Outside context entirely              │
-│  - Accessible only via tool calls        │
-│    (file read, search, retrieval)        │
+│  - Accessible via replay/hydration      │
+│    and file-based tools                  │
 │  Budget: unlimited (disk/DB)             │
 └─────────────────────────────────────────┘
 ```
 
 **Key principle:** Context is not memory — context is attention. Unlike OS memory (passive storage), LLM context actively shapes every token generated. A file at the bottom of 128k context degrades attention to everything else. This reframes compaction from "what to evict" to "what should the model be thinking about right now."
+
+#### Tier-3 event stream (authoritative session record)
+
+Tier 3 is not abstract. Every mutation to the in-memory view — `append_user_input`, `append_assistant_response`, `append_tool_exchange`, `append_system_message`, plus a once-per-session `record_session_started` — fans out through a `SessionEventSink` trait to an append-only `SessionEvent` stream before the view itself is touched. The stream is the authoritative session record; the `ContextStore` is a derivable projection of it. The record-before-mutate ordering makes "the stream is the truth" a structural invariant: a crash between record and mutate leaves the stream slightly ahead, which is recoverable; the opposite ordering is not.
+
+Two sinks ship in `kernel-core`: `NullSink` (drops every event — the default for unit tests and in-process library callers) and `FileSink` (appends one JSON object per line to a specified path, `u64` millisecond timestamps, serde-tagged variants). `ContextManager` exposes `new`, `with_store`, `with_event_sink`, and `with_store_and_events` constructors so test and production call sites can mix-and-match store and sink independently. `FileSink` exposes `path()` and `failed_writes()` accessors for observability — a non-zero failed-write counter means the stream is no longer authoritative.
+
+The `kernel-daemon` router wires a `FileSink` for every session it creates, resolving the path via `session_events::default_events_path(session_id)`. The base directory is `$AGENT_KERNEL_HOME` if set, else `$HOME/.agent-kernel`, else `./.agent-kernel`; the events file lives at `<base>/sessions/{id}/events.jsonl`. Sessions are globally addressable — the workspace is recorded inside the `SessionStarted` event as metadata, not encoded in the filesystem path, so any past session's events can be located without knowing the original workspace. If `FileSink::new` fails (unwritable base directory) the daemon falls back to `NullSink` with a stderr warning rather than aborting session creation.
+
+**Replay and hydration.** The read side lives in the same module. `session_events::read_events_from_file(path)` parses a JSONL file line-by-line into `Vec<SessionEvent>`, failing with `io::ErrorKind::InvalidData` and the 1-based line number on the first malformed entry — no forward recovery. `ContextManager::replay_events(&[SessionEvent])` walks an event slice and calls the same `append_*` methods that wrote them (against a `NullSink` so replay doesn't duplicate events back out to disk); `ContextManager::hydrated_from_events(config, events)` is the constructor form, which requires `SessionStarted` as the first event to recover the original `system_prompt`. `SessionManager::hydrate_from_events` builds a full `Session` around a hydrated `ContextManager` and registers it — policy, tools, completion config, and resource budget are caller-provided because they aren't round-trippable through the current event schema. Workspace sync and cross-machine hydration are deferred.
 
 #### The information asymmetry problem
 
@@ -227,6 +239,8 @@ The context manager knows what fits but not what matters. The model knows what m
 #### Opinionated compaction
 
 Compaction is internal to the core and not a swappable strategy. It touches every internal data structure the context manager owns. Making it pluggable creates an interface so wide it's not really a boundary (like Linux's page replacement — compiled in, not a loadable module).
+
+Compaction is a **projection over the in-memory view**, not a mutation of history. `ContextManager::compact(&dyn ProviderInterface)` walks compacted turns, formats each as prose via an internal `turn_to_prose` helper, and calls `provider.complete(...)` with a hard-coded 2-3-sentence summarization prompt (concise compaction assistant, preserve concrete facts, drop incidental detail, no tool definitions) to generate a real summary. The old 100-char `summarize_turn()` truncation stub is gone. The Tier-3 event stream is untouched by compaction — this is pinned by a `compaction_does_not_touch_event_stream` test that compares real `FileSink` bytes before and after — so the full-fidelity history can always be re-derived by replaying events into a fresh `ContextManager`. `SessionControl::request_compaction` takes a `&dyn ProviderInterface` argument for the same reason; the `RequestCompaction` event-loop handler passes `&*self.provider` through.
 
 **Compaction defaults:**
 
@@ -391,6 +405,8 @@ fn run_turn(&mut self) {
 ```
 
 **For v0.1:** the session manager manages exactly one session. The interface exists so that v0.2 can add multi-session, child spawning, and webhook delivery without breaking the core architecture.
+
+**Shipped session-construction entry points:** `spawn_interactive` (default `NullSink`), `spawn_interactive_with_events` (caller supplies a `Box<dyn SessionEventSink>`, used by the daemon and by event-stream integration tests), and `hydrate_from_events` (reads an `events.jsonl` file and reconstructs an in-memory session via `ContextManager::hydrated_from_events`). `spawn_child` and `spawn_from_event` remain interface-only until multi-session lands.
 
 ---
 

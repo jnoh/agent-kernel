@@ -99,6 +99,28 @@ pub fn read_events_from_file(path: impl AsRef<Path>) -> std::io::Result<Vec<Sess
     Ok(events)
 }
 
+/// Resolve the default on-disk path for a session's events file.
+///
+/// Base directory is picked in this order:
+/// 1. `$AGENT_KERNEL_HOME` if set
+/// 2. `$HOME/.agent-kernel` (Unix default)
+/// 3. `./.agent-kernel` (last-resort fallback — CI without HOME)
+///
+/// The final path is `<base>/sessions/{id}/events.jsonl`. Parent
+/// directories are NOT created here — `FileSink::new` handles that.
+pub fn default_events_path(session_id: SessionId) -> PathBuf {
+    let base: PathBuf = if let Ok(override_path) = std::env::var("AGENT_KERNEL_HOME") {
+        PathBuf::from(override_path)
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".agent-kernel")
+    } else {
+        PathBuf::from(".agent-kernel")
+    };
+    base.join("sessions")
+        .join(format!("{}", session_id.0))
+        .join("events.jsonl")
+}
+
 /// Returns the current time as milliseconds since UNIX epoch. Used by
 /// `ContextManager` when constructing events.
 pub fn now_millis() -> u64 {
@@ -305,6 +327,71 @@ mod tests {
         });
         // No observable side effect — this test mainly verifies the trait
         // is object-safe and the method signatures compile.
+    }
+
+    /// Single test covering all three branches of `default_events_path`.
+    /// Intentionally one test rather than three: cargo test runs tests
+    /// in parallel, and env var mutation is process-wide. Serializing
+    /// all the cases into one sequential test function removes the
+    /// race risk without pulling in `serial_test`.
+    #[test]
+    fn default_events_path_resolves_base_dir() {
+        // Save whatever is currently in these vars so the test restores
+        // them on exit. This isn't bulletproof against panics, but tests
+        // shouldn't be mutating process env in the first place — this is
+        // the least-bad option.
+        let saved_override = std::env::var("AGENT_KERNEL_HOME").ok();
+        let saved_home = std::env::var("HOME").ok();
+
+        // Branch 1: AGENT_KERNEL_HOME wins.
+        unsafe {
+            std::env::set_var("AGENT_KERNEL_HOME", "/tmp/ak-test-override");
+        }
+        let p = default_events_path(SessionId(7));
+        assert!(
+            p.starts_with("/tmp/ak-test-override"),
+            "expected override prefix, got: {}",
+            p.display()
+        );
+        assert!(p.ends_with("sessions/7/events.jsonl"));
+
+        // Branch 2: AGENT_KERNEL_HOME unset, HOME wins.
+        unsafe {
+            std::env::remove_var("AGENT_KERNEL_HOME");
+            std::env::set_var("HOME", "/tmp/ak-test-home");
+        }
+        let p = default_events_path(SessionId(8));
+        assert!(
+            p.starts_with("/tmp/ak-test-home/.agent-kernel"),
+            "expected $HOME/.agent-kernel prefix, got: {}",
+            p.display()
+        );
+        assert!(p.ends_with("sessions/8/events.jsonl"));
+
+        // Branch 3: neither set — falls back to `./.agent-kernel`.
+        unsafe {
+            std::env::remove_var("AGENT_KERNEL_HOME");
+            std::env::remove_var("HOME");
+        }
+        let p = default_events_path(SessionId(9));
+        assert!(
+            p.starts_with(".agent-kernel"),
+            "expected local fallback, got: {}",
+            p.display()
+        );
+        assert!(p.ends_with("sessions/9/events.jsonl"));
+
+        // Restore.
+        unsafe {
+            match saved_override {
+                Some(v) => std::env::set_var("AGENT_KERNEL_HOME", v),
+                None => std::env::remove_var("AGENT_KERNEL_HOME"),
+            }
+            match saved_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]

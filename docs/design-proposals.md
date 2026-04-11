@@ -128,6 +128,8 @@ If a session lives for hours/days, it must survive restarts, machine failures, a
 ### Status
 Partially resolved. Spec 0003 added the append-only event stream (`SessionEventSink`, `FileSink`, `events.jsonl`) so every `append_*` on the context manager is durably recorded. Spec 0005 added the read path: `session_events::read_events_from_file`, `ContextManager::replay_events` / `hydrated_from_events`, and `SessionManager::hydrate_from_events`. A session can now be rebuilt in-memory from a local `events.jsonl` by replaying events through the same `append_*` methods that wrote them (a `NullSink` prevents re-emission).
 
+Spec 0006 moved the default on-disk location from `<workspace>/.agent-kernel/session-{id}/events.jsonl` to `<base>/sessions/{id}/events.jsonl`, where `<base>` is `$AGENT_KERNEL_HOME`, else `$HOME/.agent-kernel`, else `./.agent-kernel`. Sessions are now globally addressable — the workspace is preserved as metadata inside the `SessionStarted` event, not as filesystem structure — which closes out the "find any past session without knowing its workspace" prerequisite for the future session store.
+
 What's still deferred: the full `SessionSnapshot` shape below (scratchpad, tokens_used, compaction state, pending_results, parent/children, tool sources, metadata) is not yet in the event schema — hydration today reconstructs the turn view only, and non-historical config (policy, tools, completion config, resource budget) is caller-provided at hydrate time. Workspace sync and remote/cross-machine hydration are out of scope for spec 0005 (see specs 0007/0008).
 
 ### Proposed Change
