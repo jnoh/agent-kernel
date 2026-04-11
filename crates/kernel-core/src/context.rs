@@ -1,4 +1,5 @@
 use crate::context_store::{ContextStore, InMemoryContextStore};
+use crate::session_events::{NullSink, SessionEvent, SessionEventSink, now_millis};
 use kernel_interfaces::tool::ToolRegistration;
 use kernel_interfaces::types::{Content, Invalidation, Message, Prompt, Role};
 use std::collections::HashMap;
@@ -86,6 +87,10 @@ pub struct ContextManager {
     // Tier 2: Short-Term Memory (managed, evictable)
     store: Box<dyn ContextStore>,
 
+    // Tier 3: append-only authoritative event stream. Written at every
+    // mutation. Never read back from in the turn loop — pure storage.
+    events: Box<dyn SessionEventSink>,
+
     // File content cache (evictable, re-readable from disk)
     file_cache: HashMap<PathBuf, String>,
 
@@ -103,7 +108,12 @@ pub struct ContextManager {
 
 impl ContextManager {
     pub fn new(config: ContextConfig, system_prompt: String) -> Self {
-        Self::with_store(config, system_prompt, Box::new(InMemoryContextStore::new()))
+        Self::with_store_and_events(
+            config,
+            system_prompt,
+            Box::new(InMemoryContextStore::new()),
+            Box::new(NullSink::default()),
+        )
     }
 
     /// Create a context manager with a custom storage backend.
@@ -111,6 +121,30 @@ impl ContextManager {
         config: ContextConfig,
         system_prompt: String,
         store: Box<dyn ContextStore>,
+    ) -> Self {
+        Self::with_store_and_events(config, system_prompt, store, Box::new(NullSink::default()))
+    }
+
+    /// Create a context manager with a custom event sink (default in-memory store).
+    pub fn with_event_sink(
+        config: ContextConfig,
+        system_prompt: String,
+        events: Box<dyn SessionEventSink>,
+    ) -> Self {
+        Self::with_store_and_events(
+            config,
+            system_prompt,
+            Box::new(InMemoryContextStore::new()),
+            events,
+        )
+    }
+
+    /// Create a context manager with both a custom store and a custom event sink.
+    pub fn with_store_and_events(
+        config: ContextConfig,
+        system_prompt: String,
+        store: Box<dyn ContextStore>,
+        events: Box<dyn SessionEventSink>,
     ) -> Self {
         let system_prompt_tokens = estimate_tokens(&system_prompt);
         let max_system = (config.context_window as f64 * config.system_prompt_budget) as usize;
@@ -127,6 +161,7 @@ impl ContextManager {
             system_prompt,
             scratchpad: Scratchpad::default(),
             store,
+            events,
             file_cache: HashMap::new(),
             tool_definitions_in_context: Vec::new(),
             tool_names_in_context: Vec::new(),
@@ -134,6 +169,19 @@ impl ContextManager {
             consecutive_compaction_failures: 0,
             last_compaction_time: None,
         }
+    }
+
+    /// Emit a `SessionStarted` event. Called once after a session is
+    /// fully constructed (all policy/workspace details known). Safe on
+    /// a `NullSink` — no-op in that case.
+    pub fn record_session_started(&mut self, workspace: String, policy_name: String) {
+        self.events.record(SessionEvent::SessionStarted {
+            timestamp_ms: now_millis(),
+            turn_index: self.store.turn_count(),
+            workspace,
+            system_prompt: self.system_prompt.clone(),
+            policy_name,
+        });
     }
 
     /// Current token usage.
@@ -172,6 +220,14 @@ impl ContextManager {
 
     /// Append a user input as a new turn.
     pub fn append_user_input(&mut self, text: String) {
+        // Record BEFORE mutating the view. The event stream is Tier-3
+        // authoritative; the view mutation is derived from it. If a sink
+        // ever becomes fatal we'd want to see it before the view diverges.
+        self.events.record(SessionEvent::UserInput {
+            timestamp_ms: now_millis(),
+            turn_index: self.store.turn_count(),
+            text: text.clone(),
+        });
         let tokens = estimate_tokens(&text);
         self.store.append_turn(Turn {
             input: Message {
@@ -188,6 +244,12 @@ impl ContextManager {
 
     /// Record the assistant's response for the current turn.
     pub fn append_assistant_response(&mut self, text: String) {
+        let turn_index = self.store.turn_count().saturating_sub(1);
+        self.events.record(SessionEvent::AssistantResponse {
+            timestamp_ms: now_millis(),
+            turn_index,
+            text: text.clone(),
+        });
         let tokens = estimate_tokens(&text);
         if let Some(turn) = self.store.last_turn_mut() {
             turn.response = Some(Message {
@@ -206,6 +268,14 @@ impl ContextManager {
         input: serde_json::Value,
         result: serde_json::Value,
     ) {
+        let turn_index = self.store.turn_count().saturating_sub(1);
+        self.events.record(SessionEvent::ToolExchange {
+            timestamp_ms: now_millis(),
+            turn_index,
+            tool_name: tool_name.clone(),
+            input: input.clone(),
+            result: result.clone(),
+        });
         let tokens = estimate_tokens(&input.to_string()) + estimate_tokens(&result.to_string());
         if let Some(turn) = self.store.last_turn_mut() {
             turn.tool_exchanges.push(ToolExchange {
@@ -221,6 +291,11 @@ impl ContextManager {
 
     /// Append a system message (e.g., from child session completion or external event).
     pub fn append_system_message(&mut self, text: String) {
+        self.events.record(SessionEvent::SystemMessage {
+            timestamp_ms: now_millis(),
+            turn_index: self.store.turn_count(),
+            text: text.clone(),
+        });
         let tokens = estimate_tokens(&text);
         self.store.append_turn(Turn {
             input: Message {
@@ -488,6 +563,7 @@ fn summarize_turn(turn: &Turn) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn test_config() -> ContextConfig {
         ContextConfig {
@@ -496,6 +572,114 @@ mod tests {
             compaction_cooldown_secs: 0, // no cooldown in tests
             ..Default::default()
         }
+    }
+
+    /// Shared-memory test sink used to assert the fan-out from
+    /// `ContextManager` mutation methods to the event stream.
+    struct VecSink {
+        session_id: kernel_interfaces::types::SessionId,
+        events: Arc<Mutex<Vec<SessionEvent>>>,
+    }
+
+    impl SessionEventSink for VecSink {
+        fn session_id(&self) -> kernel_interfaces::types::SessionId {
+            self.session_id
+        }
+
+        fn record(&mut self, event: SessionEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[test]
+    fn context_manager_fans_out_to_event_sink() {
+        let captured: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = VecSink {
+            session_id: kernel_interfaces::types::SessionId(9),
+            events: captured.clone(),
+        };
+        let mut cm =
+            ContextManager::with_event_sink(test_config(), "System.".into(), Box::new(sink));
+
+        cm.record_session_started("/tmp/workspace".into(), "test-policy".into());
+        cm.append_user_input("hi".into());
+        cm.append_assistant_response("hello".into());
+        cm.append_tool_exchange(
+            "file_read".into(),
+            serde_json::json!({"path": "a.txt"}),
+            serde_json::json!({"content": "abc"}),
+        );
+        cm.append_system_message("[external] ping".into());
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 5);
+        assert!(matches!(events[0], SessionEvent::SessionStarted { .. }));
+        assert!(matches!(events[1], SessionEvent::UserInput { ref text, .. } if text == "hi"));
+        assert!(
+            matches!(events[2], SessionEvent::AssistantResponse { ref text, .. } if text == "hello")
+        );
+        assert!(
+            matches!(events[3], SessionEvent::ToolExchange { ref tool_name, .. } if tool_name == "file_read")
+        );
+        assert!(
+            matches!(events[4], SessionEvent::SystemMessage { ref text, .. } if text == "[external] ping")
+        );
+    }
+
+    #[test]
+    fn compaction_does_not_touch_event_stream() {
+        // Compaction mutates the view (store) but must not emit, edit,
+        // or drop any events. The stream before compaction == after —
+        // verified both via a VecSink snapshot AND a byte-for-byte
+        // comparison of a real FileSink's backing file.
+        use crate::session_events::FileSink;
+
+        let captured: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let vec_sink = VecSink {
+            session_id: kernel_interfaces::types::SessionId(3),
+            events: captured.clone(),
+        };
+        let config = ContextConfig {
+            context_window: 1000,
+            compaction_threshold: 0.10,
+            verbatim_tail_ratio: 0.30,
+            compaction_cooldown_secs: 0,
+            ..Default::default()
+        };
+        let mut cm =
+            ContextManager::with_event_sink(config.clone(), "sys".into(), Box::new(vec_sink));
+
+        for i in 0..10 {
+            cm.append_user_input(format!(
+                "Turn {i} with enough text to register as non-trivial tokens and trigger the compaction window."
+            ));
+        }
+        let before = captured.lock().unwrap().clone();
+        cm.compact().expect("compaction should succeed");
+        let after = captured.lock().unwrap().clone();
+
+        assert_eq!(
+            before, after,
+            "compaction must not modify the captured events"
+        );
+
+        // And again, against a real FileSink — byte-for-byte.
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("events.jsonl");
+        let file_sink = FileSink::new(kernel_interfaces::types::SessionId(4), &log_path).unwrap();
+        let mut cm2 = ContextManager::with_event_sink(config, "sys".into(), Box::new(file_sink));
+        for i in 0..10 {
+            cm2.append_user_input(format!(
+                "Turn {i} with enough text to register as non-trivial tokens and trigger the compaction window."
+            ));
+        }
+        let bytes_before = std::fs::read(&log_path).expect("read before");
+        cm2.compact().expect("compaction should succeed");
+        let bytes_after = std::fs::read(&log_path).expect("read after");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "compaction must not modify the on-disk event file"
+        );
     }
 
     #[test]

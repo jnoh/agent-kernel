@@ -6,5 +6,6 @@ pub mod permission;
 pub mod proxy_frontend;
 pub mod proxy_tool;
 pub mod session;
+pub mod session_events;
 pub mod testutil;
 pub mod turn_loop;

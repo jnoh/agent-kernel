@@ -93,6 +93,7 @@ impl InProcessKernel {
             tools,
             provider,
             frontend,
+            events: Box::new(crate::session_events::NullSink::new(session_id)),
         };
 
         let mut event_loop = EventLoop::new(el_config, input_rx, event_tx);

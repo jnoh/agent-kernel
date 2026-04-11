@@ -11,6 +11,9 @@ use crate::context::ContextConfig;
 use crate::permission::PermissionEvaluator;
 use crate::proxy_frontend::ProxyFrontend;
 use crate::session::{PendingResult, Session};
+#[cfg(test)]
+use crate::session_events::NullSink;
+use crate::session_events::SessionEventSink;
 use crate::turn_loop::TurnLoop;
 use crossbeam_channel::{Receiver, Sender};
 use kernel_interfaces::frontend::{KernelError, SessionControl};
@@ -29,6 +32,32 @@ pub struct EventLoopConfig {
     pub tools: Vec<Box<dyn ToolRegistration>>,
     pub provider: Box<dyn ProviderInterface + Send>,
     pub frontend: ProxyFrontend,
+    /// Append-only session event sink. Daemon injects a `FileSink`;
+    /// tests use a `NullSink`.
+    pub events: Box<dyn SessionEventSink>,
+}
+
+impl EventLoopConfig {
+    /// Helper for tests: builds a config with a `NullSink`. Keeps the
+    /// test code that constructs `EventLoopConfig` from sprouting a
+    /// `events: Box::new(NullSink::default())` line in every call site.
+    #[cfg(test)]
+    pub fn with_null_sink(
+        session_id: SessionId,
+        session_create: SessionCreateConfig,
+        tools: Vec<Box<dyn ToolRegistration>>,
+        provider: Box<dyn ProviderInterface + Send>,
+        frontend: ProxyFrontend,
+    ) -> Self {
+        Self {
+            session_id,
+            session_create,
+            tools,
+            provider,
+            frontend,
+            events: Box::new(NullSink::new(session_id)),
+        }
+    }
 }
 
 /// The event loop — receives commands and drives the session.
@@ -54,7 +83,13 @@ impl EventLoop {
             ..Default::default()
         };
 
-        let context = crate::context::ContextManager::new(context_config, sc.system_prompt);
+        let mut context = crate::context::ContextManager::with_event_sink(
+            context_config,
+            sc.system_prompt.clone(),
+            config.events,
+        );
+        context.record_session_started(sc.workspace.clone(), sc.policy.name.clone());
+
         let permission = PermissionEvaluator::new(sc.policy);
         let turn_loop = TurnLoop::new(
             sc.completion_config,
@@ -214,9 +249,9 @@ mod tests {
             Duration::from_secs(10),
         );
 
-        let config = EventLoopConfig {
+        let config = EventLoopConfig::with_null_sink(
             session_id,
-            session_create: SessionCreateConfig {
+            SessionCreateConfig {
                 mode: SessionMode::Interactive,
                 system_prompt: "You are helpful.".into(),
                 completion_config: CompletionConfig::default(),
@@ -227,7 +262,7 @@ mod tests {
             tools,
             provider,
             frontend,
-        };
+        );
 
         let mut event_loop = EventLoop::new(config, input_rx, output_tx);
         let handle = std::thread::spawn(move || {

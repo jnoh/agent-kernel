@@ -709,3 +709,67 @@ fn e2e_tool_execution_error() {
     // Suppress unused variable warning
     drop(failing_tool);
 }
+
+/// A single turn end-to-end produces a non-empty session event file that
+/// includes `SessionStarted` and `UserInput` events, proving the Tier-3
+/// event stream is wired through `spawn_interactive_with_events`.
+#[test]
+fn e2e_session_events_written_to_file() {
+    use kernel_core::session_events::{FileSink, SessionEvent};
+    use std::io::{BufRead, BufReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log_path = tmp.path().join("session-0").join("events.jsonl");
+
+    let sink = FileSink::new(SessionId(0), &log_path).expect("open file sink");
+    let mut mgr = SessionManager::new(ResourceBudget::default());
+    let id = mgr.spawn_interactive_with_events(
+        session_config(allow_all_policy()),
+        Vec::new(),
+        Box::new(sink),
+    );
+    let session = mgr.get_mut(id).unwrap();
+
+    session.add_user_input("What files are here?".into());
+    let provider = ScriptedProvider::new(vec![Response {
+        content: vec![Content::Text("Let me check.".into())],
+        usage: Usage::default(),
+        stop_reason: StopReason::EndTurn,
+    }]);
+    let frontend = RecordingFrontend::auto_allow();
+    session.run_turn(&provider, &frontend).unwrap();
+
+    // Drop the SessionManager so the FileSink inside the session flushes
+    // and closes its BufWriter before we read the file back.
+    drop(mgr);
+
+    let file = std::fs::File::open(&log_path).expect("event file exists");
+    let lines: Vec<String> = BufReader::new(file)
+        .lines()
+        .collect::<Result<_, _>>()
+        .expect("read event lines");
+    let events: Vec<SessionEvent> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).expect("parse event"))
+        .collect();
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::SessionStarted { .. })),
+        "expected SessionStarted event"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SessionEvent::UserInput { text, .. } if text == "What files are here?"
+        )),
+        "expected UserInput event with matching text"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::AssistantResponse { .. })),
+        "expected AssistantResponse event"
+    );
+}

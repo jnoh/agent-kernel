@@ -8,6 +8,7 @@ use kernel_interfaces::types::{
 
 use crate::context::{ContextConfig, ContextManager};
 use crate::permission::PermissionEvaluator;
+use crate::session_events::SessionEventSink;
 use crate::turn_loop::{TurnError, TurnLoop, TurnResult};
 
 use std::path::PathBuf;
@@ -213,6 +214,45 @@ impl SessionManager {
         self.next_id += 1;
 
         let context = ContextManager::new(config.context_config, config.system_prompt);
+        let permission = PermissionEvaluator::new(config.policy);
+        let turn_loop = TurnLoop::new(
+            config.completion_config,
+            config.resource_budget.max_tool_invocations_per_turn,
+        );
+
+        let session = Session::new(
+            id,
+            config.mode,
+            config.workspace,
+            context,
+            permission,
+            turn_loop,
+            tools,
+            config.resource_budget.max_tokens_per_session,
+        );
+
+        self.sessions.push(session);
+        id
+    }
+
+    /// Spawn an interactive session with a custom event sink. Used by
+    /// callers that want authoritative Tier-3 storage (file-backed or
+    /// otherwise). The default `spawn_interactive` uses a `NullSink`.
+    pub fn spawn_interactive_with_events(
+        &mut self,
+        config: SessionConfig,
+        tools: Vec<Box<dyn ToolRegistration>>,
+        events: Box<dyn SessionEventSink>,
+    ) -> SessionId {
+        let id = SessionId(self.next_id);
+        self.next_id += 1;
+
+        let policy_name = config.policy.name.clone();
+        let workspace_str = config.workspace.to_string_lossy().into_owned();
+        let mut context =
+            ContextManager::with_event_sink(config.context_config, config.system_prompt, events);
+        context.record_session_started(workspace_str, policy_name);
+
         let permission = PermissionEvaluator::new(config.policy);
         let turn_loop = TurnLoop::new(
             config.completion_config,
