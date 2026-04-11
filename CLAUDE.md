@@ -86,13 +86,17 @@ This project is built semi-autonomously from scoped specs in `specs/`. When the 
 
 ### Sync docs/ after every spec completion
 
-When a spec flips to `done`, the system's reality has changed and `docs/` may have drifted. Before the final commit, invoke a doc-sync subagent to find and fix any drift. Delegate this to a subagent (via the `Agent` tool, `subagent_type: "general-purpose"`) rather than doing it in the main conversation — a doc scan pulls in hundreds of lines of architecture prose that would pollute the executing Claude's context, and the judgment "is this sentence still true?" benefits from a cold reader who hasn't been immersed in the implementation.
+When a spec flips to `done`, `docs/` must be updated to reflect the new reality — `architecture.md` (and siblings) are the authoritative description of **what the kernel actually does today**, not what it intended to do at v0.1 draft time. Every completed spec either **removes stale content**, **corrects now-incorrect content**, **or adds a new section** describing a capability that didn't exist before. Letting architecture docs ossify while the code evolves turns them into lies; the repo already had to clean up that mess once.
+
+Before the final commit, invoke a doc-sync subagent to handle this. Delegate to a subagent (via `Agent`, `subagent_type: "general-purpose"`) rather than doing it in the main conversation — a doc update pulls in hundreds of lines of architecture prose that would pollute the executing Claude's context, and a cold reader is better at "what's still true? what's newly true?" than someone who just wrote the code.
 
 **Invoke with this exact prompt, substituting `{SPEC_PATH}`:**
 
 ```
-You are a documentation-sync reviewer. A spec just moved to `done` and you
-need to find and fix any resulting drift in docs/.
+You are a documentation-sync reviewer. A spec just moved to `done`. Your
+job is to update docs/ so it accurately describes what the kernel does
+NOW — both by removing stale content and by adding descriptions of
+capabilities that didn't exist before this spec.
 
 Inputs:
 - Completed spec: {SPEC_PATH}
@@ -100,44 +104,57 @@ Inputs:
 - Diff command: git diff HEAD (the spec's uncommitted changes)
 
 Procedure:
-1. Read the spec file in full, including its Notes section — that's where
-   the execution-time decisions live.
+1. Read the spec file in full, including its Notes section.
 2. Run the diff command and read the diff.
 3. For each file in docs/ (skipping spec-protocol.md), read it and
-   identify content that is now stale. Typical drift:
-     - Roadmap items not crossed off
-     - Code snippets that no longer match the implementation
-     - File or symbol paths that were renamed
-     - Features described as "missing" or "deferred" that now exist
-     - Features described as present that were removed
-     - "What v0.1 defers" entries that no longer defer
-4. Apply edits directly using the Edit tool. Do not ask for approval —
-   you are operating in edit mode. Be conservative: touch only lines
-   that are actually stale. Do not rewrite unchanged content, do not
-   restructure, do not add new sections unless the spec explicitly
-   removed a concept that needs removal.
-5. If you find something stale but the correct fix is unclear (e.g.,
-   the spec changed something partially and docs need a judgment call),
-   leave the file alone and flag it in your final report.
-6. If nothing needs updating, report "no drift found" and stop.
+   decide what needs to change. Two categories:
 
-Report format (under 200 words, no preamble):
+   (a) DRIFT — content that is now stale or wrong:
+       - Roadmap items that should be crossed off
+       - Code snippets that no longer match the implementation
+       - File or symbol paths that were renamed
+       - Features described as "missing" / "deferred" that now exist
+       - Features described as present that were removed
+       - "v0.1 defers" entries that no longer defer
+
+   (b) GROWTH — content the spec's shipped code should have but doesn't:
+       - architecture.md subsystem descriptions that omit the new
+         behavior (e.g., a new trait, a new path, a new event type)
+       - A capability promoted from "deferred" to "shipped" — update
+         the description instead of just deleting the "deferred" line
+       - A new data flow introduced by the spec — add it to the
+         relevant §N subsystem section
+
+       The architecture doc is the single source of truth for what
+       the kernel does today. If you just shipped a new subsystem
+       and architecture.md doesn't mention it, that's a doc bug, not
+       "scope creep." Add it. Be concise — 1-3 paragraphs for a new
+       concept, a single code snippet if the shape matters.
+
+4. Apply edits directly using the Edit tool. No approval needed.
+5. If a needed addition requires a judgment call you can't make from
+   spec + diff alone, flag it in your report instead of guessing.
+6. If nothing needs updating, report "no changes needed."
+
+Report format (under 250 words, no preamble):
 - Files touched: [list, or "none"]
-- What changed: [one bullet per edit, citing file:line]
-- Flagged (unclear fix): [one bullet per item, or "none"]
+- Drift corrections: [bullet per edit, citing file:line]
+- Growth additions: [bullet per addition, citing file:line + brief summary]
+- Flagged (unclear fix): [bullet per item, or "none"]
 
 Constraints:
-- Do not edit specs/, CLAUDE.md, crates/, or spec-protocol.md — only
-  the rest of docs/.
-- Do not propose new documentation; only maintain existing text.
-- Do not run `cargo` commands — you're checking docs against code by
-  reading, not building.
+- Do NOT edit specs/, CLAUDE.md, crates/, or spec-protocol.md.
+- DO add new content to architecture.md and siblings when the spec
+  introduces a concept those docs should describe.
+- Stay concise. A 1-paragraph subsystem addition beats a 10-paragraph
+  one. Match the surrounding doc's density.
+- Do not run `cargo` commands.
 ```
 
 **Handling the report:**
-- **"no drift found"** → proceed to commit without doc changes.
-- **Edits made** → stage them alongside the spec's code changes and include in the same commit. The spec completion and its doc sync ship together.
-- **Flagged items** → surface each to the user before committing. Do not silently skip them. The user decides whether to fix the doc, amend the spec, or punt.
+- **"no changes needed"** → proceed to commit without doc changes.
+- **Edits made (drift or growth)** → stage them alongside the spec's code changes and include in the same commit. The spec completion and its doc sync ship together.
+- **Flagged items** → surface each to the user before committing. Do not silently skip them.
 
 ## Commit hygiene
 
