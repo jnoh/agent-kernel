@@ -81,6 +81,7 @@ mod tests {
             provider: ProviderConfig::Echo,
             policy: None,
             tools: None,
+            frontend: None,
         }
     }
 
@@ -100,6 +101,7 @@ mod tests {
             },
             policy: None,
             tools: None,
+            frontend: None,
         }
     }
 

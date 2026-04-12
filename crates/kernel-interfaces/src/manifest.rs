@@ -38,6 +38,8 @@ pub struct DistributionManifest {
     pub policy: Option<PolicyConfig>,
     #[serde(default)]
     pub tools: Option<ToolsConfig>,
+    #[serde(default)]
+    pub frontend: Option<FrontendConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +71,19 @@ pub struct PolicyConfig {
     /// Path to a YAML policy file, relative to the manifest file's
     /// directory. Absolute paths also work.
     pub file: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FrontendKind {
+    Tui,
+    Repl,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontendConfig {
+    #[serde(rename = "type")]
+    pub kind: FrontendKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -224,6 +239,50 @@ enabled = ["file_read", "grep"]
         let manifest = load_manifest(f.path()).expect("parse");
         let tools = manifest.tools.expect("tools section present");
         assert_eq!(tools.enabled, vec!["file_read", "grep"]);
+    }
+
+    #[test]
+    fn parses_frontend_tui() {
+        let f = write_toml(
+            r#"
+[distribution]
+name = "x"
+version = "0.0.0"
+
+[provider]
+type = "echo"
+
+[frontend]
+type = "tui"
+"#,
+        );
+        let manifest = load_manifest(f.path()).expect("parse");
+        assert_eq!(
+            manifest.frontend.expect("frontend section").kind,
+            FrontendKind::Tui
+        );
+    }
+
+    #[test]
+    fn parses_frontend_repl() {
+        let f = write_toml(
+            r#"
+[distribution]
+name = "x"
+version = "0.0.0"
+
+[provider]
+type = "echo"
+
+[frontend]
+type = "repl"
+"#,
+        );
+        let manifest = load_manifest(f.path()).expect("parse");
+        assert_eq!(
+            manifest.frontend.expect("frontend section").kind,
+            FrontendKind::Repl
+        );
     }
 
     #[test]

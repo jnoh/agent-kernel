@@ -240,10 +240,19 @@ fn main() {
         }
     };
 
-    if repl_mode {
-        run_repl(&socket_path, &workspace, settings);
+    use kernel_interfaces::manifest::FrontendKind;
+    let frontend_kind = if repl_mode {
+        eprintln!(
+            "warning: --repl CLI flag is deprecated; prefer [frontend] type = \"repl\" in the manifest"
+        );
+        FrontendKind::Repl
     } else {
-        run_tui(&socket_path, &workspace, settings);
+        settings.frontend
+    };
+
+    match frontend_kind {
+        FrontendKind::Repl => run_repl(&socket_path, &workspace, settings),
+        FrontendKind::Tui => run_tui(&socket_path, &workspace, settings),
     }
 }
 
@@ -254,6 +263,7 @@ struct DistributionSettings {
     /// `None` means "use every tool the distribution implements".
     /// `Some(ids)` filters to the named set.
     enabled_tools: Option<Vec<String>>,
+    frontend: kernel_interfaces::manifest::FrontendKind,
 }
 
 impl DistributionSettings {
@@ -263,13 +273,15 @@ impl DistributionSettings {
         Self {
             policy: default_policy(),
             enabled_tools: None,
+            frontend: kernel_interfaces::manifest::FrontendKind::Tui,
         }
     }
 }
 
 /// Load a full `DistributionSettings` from a manifest file: policy YAML
 /// resolved against the manifest directory, plus the `[tools]` enabled
-/// list if present. Returns an error string if any step fails.
+/// list and `[frontend]` kind if present. Returns an error string if
+/// any step fails.
 fn load_distribution_settings(
     manifest_path: &std::path::Path,
 ) -> Result<DistributionSettings, String> {
@@ -291,9 +303,16 @@ fn load_distribution_settings(
 
     let enabled_tools = manifest.tools.as_ref().map(|t| t.enabled.clone());
 
+    let frontend = manifest
+        .frontend
+        .as_ref()
+        .map(|f| f.kind)
+        .unwrap_or(kernel_interfaces::manifest::FrontendKind::Tui);
+
     Ok(DistributionSettings {
         policy,
         enabled_tools,
+        frontend,
     })
 }
 

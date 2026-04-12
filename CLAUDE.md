@@ -14,6 +14,7 @@ agent-kernel/
 │   ├── kernel-providers/    # First-party ProviderInterface impls (Anthropic, Echo)
 │   ├── kernel-daemon/       # Unix-socket daemon that hosts sessions
 │   └── dist-code-agent/     # Reference coding-agent distribution (binary: agent-kernel)
+├── distros/                 # Distribution manifests (code-agent.toml); the binary reads one at startup
 ├── docs/                    # Architecture spec, design proposals, spec protocol, roadmap
 ├── policies/                # YAML policy files (permissive.yaml, lockdown.yaml)
 ├── specs/                   # Scoped work units (see docs/spec-protocol.md)

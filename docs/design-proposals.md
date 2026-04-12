@@ -83,6 +83,9 @@ Don't build this now. The current inline model works for one distro with 5 tools
 - Sub-agent spawning (§5) needs workers to access tools without round-tripping to the distro
 - A second distro needs to reuse the same tools
 
+### Status
+Partial: spec 0013 added manifest-driven **tool selection** via `[tools] enabled = [...]` in `distros/code-agent.toml`, backed by a `TOOL_IDS` constant and a filter in `dist-code-agent::tools::create_tools`. This is a configuration seam, not an ownership transfer — tools are still compiled into the distro binary, the kernel still dispatches via `ExecuteTool` events, and there is no MCP client, no `ConnectToolServer` request, and no `ToolSource` enum. The target architecture above is unchanged; what changed is that distribution authors can now pick which compiled-in tools ship without editing Rust.
+
 ---
 
 ## 2. Long-Running Sessions

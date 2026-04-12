@@ -13,3 +13,6 @@ file = "../policies/permissive.yaml"
 
 [tools]
 enabled = ["file_read", "file_write", "file_edit", "shell", "ls", "grep"]
+
+[frontend]
+type = "tui"

@@ -953,8 +953,10 @@ The `@tool` decorator generates the `tool.toml` manifest at publish time from th
 
 A distribution is a **manifest of manifests** — tools + policy + skills + provider config + frontend. It packages the kernel with everything needed for a specific agent use case. The relationship is Linux kernel to Ubuntu/Fedora/Android.
 
+The first real manifest ships in `distros/code-agent.toml`, loaded at startup by both `kernel-daemon --distro <path>` (provider selection, specs 0011) and `dist-code-agent --distro <path>` (policy file, tool filter, frontend kind — specs 0012, 0013, 0014):
+
 ```toml
-# dist/code-agent.toml
+# distros/code-agent.toml
 
 [distribution]
 name = "code-agent"
@@ -962,52 +964,31 @@ version = "0.1.0"
 
 [provider]
 type = "anthropic"
-model = "claude-sonnet-4-20250514"
+model = "claude-sonnet-4-5"
+api_key_env = "ANTHROPIC_API_KEY"
+fallback = "echo"              # downgrade to EchoProvider if the env var is missing
 
 [policy]
-file = "policies/developer-permissive.yaml"
+file = "../policies/permissive.yaml"   # path resolved relative to the manifest
 
-[tools.builtin]
-# Native Rust tools compiled into the binary via Cargo features
-include = ["file_read", "file_write", "file_edit", "grep", "glob", "ls", "shell", "git"]
-
-[tools.external]
-# Tools from the registry (loaded from manifests at runtime)
-"@acme/jira-tool" = "^0.2.0"
-
-[tools.mcp]
-# MCP servers
-github = { command = "npx", args = ["-y", "@modelcontextprotocol/server-github"] }
-
-[tools.custom]
-# Tools the distro author wrote, shipped inside the distribution
-include = ["./tools/custom-linter/"]
-
-[skills]
-include = ["python-conventions", "small-commits"]
+[tools]
+enabled = ["file_read", "file_write", "file_edit", "shell", "ls", "grep"]
 
 [frontend]
-type = "tui"
+type = "tui"                  # "tui" or "repl"
 ```
 
-**Same distribution, different environments:** The distribution manifest stays the same. The *policy file* is what changes the security posture. A `--policy` flag at install time overrides the distribution's default:
+The `DistributionManifest` type and its section structs (`ProviderConfig`, `PolicyConfig`, `ToolsConfig`, `FrontendConfig`) live in `kernel-interfaces::manifest` so both the daemon and distribution binaries parse the same shape. `dist-code-agent` bundles the parsed result into a `DistributionSettings` struct (policy, enabled-tool ID set, frontend kind) which `tools::create_tools` filters against a compile-time `TOOL_IDS` constant to produce the session's tool set.
 
-```bash
-# Developer laptop — uses the distribution's default permissive policy
-agent-kernel install dist/code-agent.toml
+**What works today vs the full vision:**
+- Provider, policy file, tool selection, and frontend kind are all manifest-driven.
+- Tools are still compiled into `dist-code-agent` — `[tools] enabled` is a filter over the built-in set, not a loader. External tools, MCP servers, and custom distro-author tools (`[tools.external]`, `[tools.mcp]`, `[tools.custom]` in the older sketch) do not exist yet.
+- Frontends are still compile-time: `FrontendKind::Tui` and `FrontendKind::Repl` both live inside `dist-code-agent`. A `frontend-tui` / `frontend-repl` split and headless variants are future work.
+- `[skills]` is not parsed.
+- There is no `agent-kernel install` subcommand; deployment is "run the daemon with `--distro`, run the distro binary with `--distro`." CLI-level overrides (`--policy`, `--frontend`, `--tool-catalog`) are not implemented — the `--repl` flag on `dist-code-agent` still works but prints a deprecation warning pointing at `[frontend] type = "repl"`.
+- Distribution authors still need to touch Rust to add a new tool or frontend. The manifest is the seam; the plugin points aren't open yet.
 
-# CI pipeline — locked-down policy, headless frontend
-agent-kernel install dist/code-agent.toml \
-  --policy policies/ci-lockdown.yaml \
-  --frontend headless
-
-# Enterprise — approved tool catalog, mandatory audit
-agent-kernel install dist/code-agent.toml \
-  --policy policies/enterprise-soc2.yaml \
-  --tool-catalog https://internal.corp/approved-tools
-```
-
-Distribution authors never touch Rust. They write Python/TS tools, YAML policies, markdown skills, and a TOML distribution manifest.
+The end-state remains: distribution authors write tools, policies, skills, and a TOML manifest; they do not touch Rust. Specs 0011-0014 moved configuration out of Rust; moving *implementations* out of Rust is the next arc.
 
 ---
 
@@ -1035,50 +1016,17 @@ Skills can be:
 
 ## 9. Configuration
 
-```toml
-# agent-kernel.toml
+There is no separate `agent-kernel.toml` — the distribution manifest (§7) is the single configuration file. Both the daemon and the distribution binary take `--distro <path>` and read the same file, each consuming the sections relevant to their role:
 
-[kernel]
-# Context management
-context_window = 200_000          # model's total context
-compaction_threshold = 0.65       # trigger compaction at 65%
-system_prompt_budget = 0.15       # max 15% for system prompt
-verbatim_tail_ratio = 0.30        # keep last 30% uncompressed
+| Section | Consumer | Effect |
+|---|---|---|
+| `[distribution]` | both | Name + version string, printed at startup for operator visibility. |
+| `[provider]` | `kernel-daemon` | Selects `AnthropicProvider` / `EchoProvider`, reads the API key from `api_key_env`, optionally falls back to `echo` when the env var is missing. |
+| `[policy]` | `dist-code-agent` | `file = "..."` points at a YAML policy file; the path is resolved relative to the manifest's directory. |
+| `[tools]` | `dist-code-agent` | `enabled = [...]` filters the compiled-in tool set by ID. Omitting the section keeps all tools. |
+| `[frontend]` | `dist-code-agent` | `type = "tui"` or `type = "repl"`. Overrides the deprecated `--repl` CLI flag. |
 
-[provider]
-type = "anthropic"
-model = "claude-sonnet-4-20250514"
-# Provider-specific config goes here
-
-[policy]
-file = "policy.yaml"
-
-[tools]
-# External tools loaded from manifests at runtime
-external_dirs = [".agent-kernel/tools/", "~/.config/agent-kernel/tools/"]
-
-# MCP servers
-[tools.mcp.github]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_TOKEN = "{env:GITHUB_TOKEN}" }
-
-[frontend]
-type = "tui"
-
-# Channels (v0.2+) — push-based event sources
-# [channels.github-webhook]
-# type = "http"
-# port = 8080
-# path = "/webhooks/github"
-#
-# [channels.cron]
-# schedule = "0 9 * * MON-FRI"   # weekday mornings
-# agent = "daily-standup"
-
-[skills]
-paths = [".agent-kernel/skills/", "~/.config/agent-kernel/skills/"]
-```
+Kernel-level tuning (context window, compaction threshold, token budgets) and channel/skill config are not yet exposed in the manifest — those values live in Rust today and will grow new sections as the relevant subsystems mature. See `distros/code-agent.toml` for the current concrete example.
 
 ---
 
@@ -1137,7 +1085,7 @@ Rust is the recommended implementation language. Rationale:
 ```
 agent-kernel/
 ├── crates/
-│   ├── kernel-interfaces/    # ProviderInterface, ToolRegistration, etc. (stable API surface)
+│   ├── kernel-interfaces/    # ProviderInterface, ToolRegistration, manifest types, etc. (stable API surface)
 │   ├── kernel-core/          # Turn loop, context manager, permission evaluator, session manager
 │   ├── kernel-providers/     # First-party ProviderInterface impls (AnthropicProvider, EchoProvider)
 │   ├── kernel-daemon/        # Unix-socket daemon hosting the kernel; router wires providers per session
