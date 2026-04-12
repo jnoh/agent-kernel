@@ -584,6 +584,7 @@ fn run_tui_loop(
                         });
                     }
                     tui::SlashCommand::Status => {
+                        app.status_requested = true;
                         let _ = input_tx.send(KernelRequest::QuerySession {
                             session_id: SessionId(0),
                         });
@@ -746,13 +747,16 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             ..
         } => {
             app.context_tokens = *tokens_used;
-            app.entries.push(tui::ConversationEntry::Info(format!(
-                "Session status: {} tokens used ({:.1}% of context), {} turns",
-                tokens_used,
-                utilization * 100.0,
-                turn_count,
-            )));
-            app.scroll_to_bottom();
+            if app.status_requested {
+                app.status_requested = false;
+                app.entries.push(tui::ConversationEntry::Info(format!(
+                    "Session status: {} tokens used ({:.1}% of context), {} turns",
+                    tokens_used,
+                    utilization * 100.0,
+                    turn_count,
+                )));
+                app.scroll_to_bottom();
+            }
         }
 
         KernelEvent::Error { error, .. } => {

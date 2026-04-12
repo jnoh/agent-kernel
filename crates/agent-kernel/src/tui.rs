@@ -6,10 +6,7 @@
 
 use crossterm::{
     ExecutableCommand,
-    event::{
-        DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
-        MouseEventKind,
-    },
+    event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind},
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
@@ -164,6 +161,11 @@ pub struct App {
     /// new policy rule without re-parsing the ConversationEntry.
     pub pending_permission_capabilities: Option<Vec<String>>,
 
+    /// When true, the next SessionStatus event shows a visible entry.
+    /// Set by `/status`; cleared after rendering. Auto-queries after
+    /// turn end update counters silently.
+    pub status_requested: bool,
+
     // --- Input history ---
     /// Past submitted inputs (oldest first).
     history: Vec<String>,
@@ -196,6 +198,7 @@ impl App {
             awaiting_permission: false,
             pending_permission_request_id: None,
             pending_permission_capabilities: None,
+            status_requested: false,
             history: Vec::new(),
             history_index: None,
             history_stash: String::new(),
@@ -765,13 +768,11 @@ fn cursor_position_in_input(input: &str, cursor: usize) -> (usize, usize) {
 pub fn init_terminal() -> io::Result<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
-    io::stdout().execute(EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     Terminal::new(backend)
 }
 
 pub fn restore_terminal() {
-    let _ = io::stdout().execute(DisableMouseCapture);
     let _ = terminal::disable_raw_mode();
     let _ = io::stdout().execute(LeaveAlternateScreen);
 }
