@@ -554,10 +554,10 @@ dependencies = [
  "crossbeam-channel",
  "kernel-core",
  "kernel-interfaces",
+ "kernel-providers",
  "serde",
  "serde_json",
  "serde_yaml",
- "ureq",
 ]
 
 [[package]]
@@ -566,6 +566,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "kernel-providers"
+version = "0.1.0"
+dependencies = [
+ "kernel-interfaces",
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

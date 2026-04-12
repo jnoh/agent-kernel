@@ -1,73 +1,13 @@
-//! Provider implementations for the kernel daemon.
-//!
-//! The daemon owns the model — it calls the LLM API directly.
-//! Distros never interact with the provider.
+//! Anthropic `ProviderInterface` implementation — real Claude API over
+//! HTTPS via `ureq`. Reads `ANTHROPIC_API_KEY` via the caller (the
+//! daemon passes it into `new`). Supports prompt caching via the
+//! `cache_control` blocks on system / tool / message content when the
+//! prefix is above the per-model cache minimum.
 
 use kernel_interfaces::provider::{
     ProviderCaps, ProviderError, ProviderInterface, Response, StopReason, Usage,
 };
 use kernel_interfaces::types::{CompletionConfig, Content, Message, Prompt, Role};
-
-// ============================================================================
-// Echo provider (stub for testing without an API key)
-// ============================================================================
-
-pub struct EchoProvider;
-
-impl ProviderInterface for EchoProvider {
-    fn complete(
-        &self,
-        prompt: &Prompt,
-        _config: &CompletionConfig,
-    ) -> Result<Response, ProviderError> {
-        let last_user = prompt
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, Role::User))
-            .and_then(|m| {
-                m.content.iter().find_map(|c| match c {
-                    Content::Text(t) => Some(t.clone()),
-                    _ => None,
-                })
-            })
-            .unwrap_or_else(|| "(no user input)".into());
-
-        Ok(Response {
-            content: vec![Content::Text(format!(
-                "[echo provider] You said: {last_user}\n\n\
-                 (Set ANTHROPIC_API_KEY to use Claude.)"
-            ))],
-            usage: Usage {
-                input_tokens: last_user.len() / 4,
-                output_tokens: 50,
-                ..Default::default()
-            },
-            stop_reason: StopReason::EndTurn,
-        })
-    }
-
-    fn count_tokens(&self, content: &Content) -> usize {
-        match content {
-            Content::Text(t) => t.len() / 4,
-            Content::ToolCall { input, .. } => input.to_string().len() / 4,
-            Content::ToolResult { result, .. } => result.to_string().len() / 4,
-        }
-    }
-
-    fn capabilities(&self) -> ProviderCaps {
-        ProviderCaps {
-            supports_tool_use: true,
-            supports_vision: false,
-            supports_streaming: false,
-            max_context_tokens: 200_000,
-        }
-    }
-}
-
-// ============================================================================
-// Anthropic provider (real Claude API)
-// ============================================================================
 
 pub struct AnthropicProvider {
     api_key: String,

@@ -1,7 +1,6 @@
 //! The kernel daemon — listens on a Unix domain socket and serves
 //! agent sessions to connected distro processes.
 
-mod provider;
 mod router;
 
 use kernel_interfaces::framing::{read_message, write_message};

@@ -1137,29 +1137,18 @@ Rust is the recommended implementation language. Rationale:
 ```
 agent-kernel/
 ├── crates/
+│   ├── kernel-interfaces/    # ProviderInterface, ToolRegistration, etc. (stable API surface)
 │   ├── kernel-core/          # Turn loop, context manager, permission evaluator, session manager
-│   ├── kernel-interfaces/    # ProviderInterface, ToolRegistration, etc. (stable)
-│   ├── provider-anthropic/   # Anthropic provider module
-│   ├── provider-openai/      # OpenAI provider module
-│   ├── provider-ollama/      # Local model provider
-│   ├── tool-filesystem/      # file_read, file_write, file_edit, grep, glob, ls
-│   ├── tool-shell/           # shell executor
-│   ├── tool-git/             # git operations
-│   ├── tool-web/             # web_fetch
-│   ├── tool-mcp-bridge/      # MCP client → ToolRegistration translator
-│   ├── channel-tui-input/    # TUI as channel (human input events)
-│   ├── frontend-tui/         # Reference TUI (control plane)
-│   └── dist-code-agent/      # Reference coding agent distribution
+│   ├── kernel-providers/     # First-party ProviderInterface impls (AnthropicProvider, EchoProvider)
+│   ├── kernel-daemon/        # Unix-socket daemon hosting the kernel; router wires providers per session
+│   └── dist-code-agent/      # Reference coding agent distribution (TUI frontend, filesystem tools)
 ├── policies/
 │   ├── permissive.yaml
-│   ├── lockdown.yaml
-│   └── routing.yaml            # Channel event → session routing rules
-├── skills/
-│   ├── python-conventions.md
-│   └── rust-conventions.md
-├── MAINTAINERS
-└── agent-kernel.toml
+│   └── lockdown.yaml
+└── specs/                    # Scoped units of work (see docs/spec-protocol.md)
 ```
+
+Additional provider crates (OpenAI, Ollama), per-category tool crates (`tool-filesystem`, `tool-shell`, `tool-git`, `tool-web`, `tool-mcp-bridge`), channel input crates, and non-TUI frontends are all deferred past v0.1. First-party providers currently share a single `kernel-providers` crate with one module per provider (`anthropic.rs`, `echo.rs`); splitting per provider is a future step if a third-party ecosystem emerges.
 
 ### What "done" looks like for v0.1
 

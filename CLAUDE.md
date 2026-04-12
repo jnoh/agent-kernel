@@ -9,11 +9,14 @@ agent-kernel is a Rust runtime layer for building AI agents. It provides core pr
 ```
 agent-kernel/
 ├── crates/
-│   ├── kernel-interfaces/   # Trait definitions and shared types (no logic)
-│   ├── kernel-core/         # Core runtime: turn loop, context, permissions, sessions
+│   ├── kernel-interfaces/   # Trait definitions and shared types (the stable API)
+│   ├── kernel-core/         # Core runtime: turn loop, context, permissions, sessions, event stream
+│   ├── kernel-providers/    # First-party ProviderInterface impls (Anthropic, Echo)
+│   ├── kernel-daemon/       # Unix-socket daemon that hosts sessions
 │   └── dist-code-agent/     # Reference coding-agent distribution (binary: agent-kernel)
-├── docs/                    # Architecture specs and project context
+├── docs/                    # Architecture spec, design proposals, spec protocol, roadmap
 ├── policies/                # YAML policy files (permissive.yaml, lockdown.yaml)
+├── specs/                   # Scoped work units (see docs/spec-protocol.md)
 ├── Cargo.toml               # Workspace root (resolver v2, edition 2024)
 └── CLAUDE.md
 ```
@@ -21,18 +24,22 @@ agent-kernel/
 ### Crate Dependency Graph
 
 ```
-kernel-interfaces  (leaf — no internal deps)
+kernel-interfaces   (leaf — no internal deps)
        ↑
-kernel-core        (depends on kernel-interfaces)
-       ↑
-dist-code-agent    (depends on kernel-interfaces + kernel-core)
+       ├── kernel-core       (runtime primitives)
+       ├── kernel-providers  (depends on kernel-interfaces only)
+       └── dist-code-agent   (depends on kernel-interfaces only; talks to daemon over socket)
+              ↑
+       kernel-daemon   (depends on kernel-interfaces + kernel-core + kernel-providers)
 ```
 
 ### Key Crates
 
-- **kernel-interfaces**: Traits (`ProviderInterface`, `ToolRegistration`, `ChannelInterface`, `FrontendEvents`, `SessionControl`, `PolicyInterface`) and shared types (`Capability`, `Content`, `ToolOutput`). This is the stable API surface.
-- **kernel-core**: The runtime — turn loop, context manager, permission evaluator, session manager. This is the "kernel" itself.
-- **dist-code-agent**: A reference distribution that wires together an Anthropic provider, filesystem tools, and a TUI frontend into a working coding agent binary.
+- **kernel-interfaces**: Seven stable traits (`ProviderInterface`, `ToolRegistration`, `ChannelInterface`, `FrontendEvents`, `SessionControl`, `PolicyInterface`, `SessionEventSink`) plus shared types (`Capability`, `Content`, `ToolOutput`, `SessionEvent`, `WorkspaceFingerprint`). The stable API surface — distributions depend only on this crate.
+- **kernel-core**: The runtime — turn loop, context manager, permission evaluator, session manager, event loop, Tier-3 sink impls (`NullSink`, `FileSink`, `HttpSink`, `TeeSink`), hydration / replay.
+- **kernel-providers**: First-party `ProviderInterface` implementations — currently `AnthropicProvider` (real Claude API via `ureq`) and `EchoProvider` (stub fallback).
+- **kernel-daemon**: Long-running process that listens on a Unix socket, wires up `EventLoop`s, picks a provider from `kernel-providers` at session-create time based on `ANTHROPIC_API_KEY`, and routes events back to connected distributions.
+- **dist-code-agent**: A reference distribution that wires together filesystem tools and a TUI frontend into a working coding agent binary (`agent-kernel`). Talks to `kernel-daemon` over a Unix socket; never touches `kernel-core` at runtime.
 
 ## Build / Verify / Test Loop
 

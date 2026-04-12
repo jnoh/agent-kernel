@@ -15,7 +15,7 @@ use kernel_interfaces::types::SessionId;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::provider::{AnthropicProvider, EchoProvider};
+use kernel_providers::{AnthropicProvider, EchoProvider};
 
 /// Per-session state tracked by the router.
 struct SessionEntry {
