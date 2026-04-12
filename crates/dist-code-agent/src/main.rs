@@ -180,6 +180,34 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
 
+    let distro_path = args
+        .iter()
+        .position(|a| a == "--distro")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+
+    // Resolve the active policy. If --distro points at a manifest with a
+    // [policy] section, read the referenced YAML file. Otherwise fall
+    // back to the deprecated inline `default_policy()`.
+    #[allow(deprecated)]
+    let policy = match distro_path.as_ref() {
+        Some(path) => match load_policy_from_manifest(path) {
+            Ok(policy) => {
+                eprintln!("distro: loaded policy from {}", path.display());
+                policy
+            }
+            Err(e) => {
+                eprintln!("distro: failed to load policy from manifest: {e}");
+                eprintln!("distro: falling back to hard-coded default_policy()");
+                default_policy()
+            }
+        },
+        None => {
+            eprintln!("warning: --distro not set; using deprecated hard-coded default_policy()");
+            default_policy()
+        }
+    };
+
     let socket_path = match socket_path {
         Some(p) => p,
         None => {
@@ -211,10 +239,30 @@ fn main() {
     };
 
     if repl_mode {
-        run_repl(&socket_path, &workspace);
+        run_repl(&socket_path, &workspace, policy);
     } else {
-        run_tui(&socket_path, &workspace);
+        run_tui(&socket_path, &workspace, policy);
     }
+}
+
+/// Load a policy from a distribution manifest's `[policy]` section.
+/// Returns a human-readable error if the manifest can't be parsed, has
+/// no policy section, or the referenced YAML file is unreadable.
+fn load_policy_from_manifest(
+    manifest_path: &std::path::Path,
+) -> Result<kernel_interfaces::policy::Policy, String> {
+    let manifest = kernel_interfaces::manifest::load_manifest(manifest_path)?;
+    let policy_cfg = manifest
+        .policy
+        .as_ref()
+        .ok_or_else(|| "manifest has no [policy] section".to_string())?;
+    let manifest_dir = kernel_interfaces::manifest::manifest_dir(manifest_path);
+    let policy_path = policy_cfg.resolve(&manifest_dir);
+    let yaml = std::fs::read_to_string(&policy_path)
+        .map_err(|e| format!("failed to read policy file {}: {e}", policy_path.display()))?;
+    let policy: kernel_interfaces::policy::Policy = serde_yaml::from_str(&yaml)
+        .map_err(|e| format!("failed to parse policy file {}: {e}", policy_path.display()))?;
+    Ok(policy)
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +274,9 @@ struct DaemonConnection {
     reader: BufReader<UnixStream>,
 }
 
+#[deprecated(
+    note = "hard-coded policy is deprecated; pass --distro <manifest.toml> with a [policy] section instead (spec 0012)"
+)]
 fn default_policy() -> kernel_interfaces::policy::Policy {
     kernel_interfaces::policy::Policy {
         version: 1,
@@ -326,9 +377,13 @@ fn connect_and_setup(
 // TUI mode
 // ---------------------------------------------------------------------------
 
-fn run_tui(socket_path: &std::path::Path, workspace: &std::path::Path) {
+fn run_tui(
+    socket_path: &std::path::Path,
+    workspace: &std::path::Path,
+    initial_policy: kernel_interfaces::policy::Policy,
+) {
     let local_tools = tools::create_tools(workspace);
-    let mut current_policy = default_policy();
+    let mut current_policy = initial_policy;
     let conn = connect_and_setup(socket_path, workspace, &local_tools, current_policy.clone());
     let writer = conn.writer;
 
@@ -765,10 +820,14 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
 // REPL mode (original behavior, for --repl flag)
 // ---------------------------------------------------------------------------
 
-fn run_repl(socket_path: &std::path::Path, workspace: &std::path::Path) {
+fn run_repl(
+    socket_path: &std::path::Path,
+    workspace: &std::path::Path,
+    policy: kernel_interfaces::policy::Policy,
+) {
     let local_tools = tools::create_tools(workspace);
     let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
-    let conn = connect_and_setup(socket_path, workspace, &local_tools, default_policy());
+    let conn = connect_and_setup(socket_path, workspace, &local_tools, policy);
     let writer = conn.writer;
 
     eprintln!("agent-kernel v0.1.0 — code-agent distribution (IPC client)");

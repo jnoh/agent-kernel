@@ -8,7 +8,7 @@ use kernel_interfaces::framing::{read_message, write_message};
 use kernel_interfaces::protocol::{KernelEvent, KernelRequest};
 use kernel_interfaces::provider::ProviderInterface;
 use kernel_providers::{AnthropicProvider, EchoProvider};
-use manifest::{ProviderFactory, load_manifest};
+use manifest::{ProviderFactory, build_provider_factory, load_manifest};
 use router::ConnectionRouter;
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixListener;
@@ -44,7 +44,7 @@ fn main() {
                 "distribution: {} v{}",
                 manifest.distribution.name, manifest.distribution.version
             );
-            manifest.provider_factory().unwrap_or_else(|e| {
+            build_provider_factory(&manifest).unwrap_or_else(|e| {
                 eprintln!("failed to build provider from manifest: {e}");
                 std::process::exit(1);
             })
