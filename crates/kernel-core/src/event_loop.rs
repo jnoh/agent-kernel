@@ -213,11 +213,27 @@ impl EventLoop {
                     }
                 }
                 Err(e) => {
+                    let msg = e.to_string();
                     let _ = self.output_tx.send(KernelEvent::Error {
                         session_id: Some(self.session_id),
                         error: KernelError {
-                            message: e.to_string(),
-                            recoverable: false,
+                            message: msg,
+                            recoverable: true,
+                        },
+                    });
+                    // Send a TurnEnded so the frontend knows the turn
+                    // is over and re-enables input.
+                    let _ = self.output_tx.send(KernelEvent::TurnEnded {
+                        session_id: self.session_id,
+                        turn_id: kernel_interfaces::types::TurnId(0),
+                        result: TurnResultSummary {
+                            tool_calls_dispatched: 0,
+                            tool_calls_denied: 0,
+                            was_cancelled: false,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
                         },
                     });
                     break;

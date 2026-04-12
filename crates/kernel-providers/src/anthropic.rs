@@ -94,19 +94,14 @@ impl AnthropicProvider {
 
         body
     }
-}
 
-impl ProviderInterface for AnthropicProvider {
-    fn complete(
-        &self,
-        prompt: &Prompt,
-        config: &CompletionConfig,
-    ) -> Result<Response, ProviderError> {
-        let body = self.build_request_body(prompt, config);
-        let body_str = serde_json::to_string(&body)
-            .map_err(|e| ProviderError::Parse(format!("failed to serialize request: {e}")))?;
-
-        let response = ureq::post("https://api.anthropic.com/v1/messages")
+    fn send_request(&self, body_str: &str) -> Result<Response, ProviderError> {
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+            .build()
+            .new_agent();
+        let response = agent
+            .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -122,15 +117,79 @@ impl ProviderInterface for AnthropicProvider {
                     .map_err(|e| ProviderError::Parse(format!("{e}: {response_text}")))?;
                 parse_response(&response_json)
             }
-            Err(ureq::Error::StatusCode(429)) => Err(ProviderError::RateLimited {
-                retry_after_secs: None,
-            }),
+            Err(ureq::Error::StatusCode(429)) => {
+                // TODO: extract retry-after header when ureq exposes it
+                Err(ProviderError::RateLimited {
+                    retry_after_secs: None,
+                })
+            }
             Err(ureq::Error::StatusCode(status)) => {
                 let message = format!("HTTP {status}");
                 Err(ProviderError::Api { status, message })
             }
             Err(e) => Err(ProviderError::Network(format!("{e:#}"))),
         }
+    }
+}
+
+/// Whether a `ProviderError` is transient and worth retrying.
+fn is_transient(err: &ProviderError) -> bool {
+    match err {
+        ProviderError::RateLimited { .. } => true,
+        ProviderError::Network(_) => true,
+        ProviderError::Api { status, .. } => (500..600).contains(status),
+        ProviderError::Parse(_) => false,
+    }
+}
+
+/// Max retry attempts for transient errors.
+const MAX_RETRIES: u32 = 3;
+
+/// HTTP request timeout in seconds.
+const REQUEST_TIMEOUT_SECS: u64 = 120;
+
+impl ProviderInterface for AnthropicProvider {
+    fn complete(
+        &self,
+        prompt: &Prompt,
+        config: &CompletionConfig,
+    ) -> Result<Response, ProviderError> {
+        let body = self.build_request_body(prompt, config);
+        let body_str = serde_json::to_string(&body)
+            .map_err(|e| ProviderError::Parse(format!("failed to serialize request: {e}")))?;
+
+        let mut last_err: Option<ProviderError> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let base_delay = match &last_err {
+                    Some(ProviderError::RateLimited {
+                        retry_after_secs: Some(secs),
+                    }) => *secs as f64,
+                    _ => (1u64 << (attempt - 1).min(4)) as f64, // 1, 2, 4s
+                };
+                // Jitter: +/- 25%
+                let jitter = 0.75 + (attempt as f64 * 0.1 % 0.5); // deterministic pseudo-jitter
+                let delay = std::time::Duration::from_secs_f64(base_delay * jitter);
+                std::thread::sleep(delay.min(std::time::Duration::from_secs(30)));
+            }
+
+            let result = self.send_request(&body_str);
+            match result {
+                Ok(resp) => return Ok(resp),
+                Err(ref e) if is_transient(e) && attempt < MAX_RETRIES => {
+                    eprintln!(
+                        "  [provider] transient error (attempt {}/{}): {e}",
+                        attempt + 1,
+                        MAX_RETRIES + 1
+                    );
+                    last_err = Some(result.unwrap_err());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| ProviderError::Network("retry exhausted".into())))
     }
 
     fn count_tokens(&self, content: &Content) -> usize {

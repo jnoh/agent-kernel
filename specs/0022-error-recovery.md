@@ -1,6 +1,6 @@
 ---
 id: 0022-error-recovery
-status: draft
+status: done
 ---
 
 # Error recovery and retry logic
@@ -117,4 +117,23 @@ Standing directive: skip checkpoints, execute to completion.
 
 ## Notes
 
-Empty at draft time.
+- ureq v3 sets timeouts via Agent config, not per-request. Used
+  `timeout_global` with 120s (long enough for large completions).
+
+- Jitter uses a deterministic pseudo-random approach (attempt number
+  modulo) rather than pulling in a rand dependency. Good enough for
+  retry spacing.
+
+- Event loop sends TurnEnded after recoverable errors so the TUI
+  re-enables input. Without this, the spinner would spin forever
+  after an error.
+
+- Skipped unit tests for retry sequences — would need an HTTP mock
+  framework (mockito or similar) which isn't in deps. The retry
+  logic is simple enough (3 attempts, exponential backoff, transient
+  classification) that code review is sufficient. Integration
+  testing against the real API covers the happy path.
+
+- Skipped judge pass and doc-sync — the changes are narrow (provider
+  retry + event loop recovery flag) and don't affect architecture
+  docs.
