@@ -1,0 +1,9 @@
+[distribution]
+name = "code-agent"
+version = "0.1.0"
+
+[provider]
+type = "anthropic"
+model = "claude-sonnet-4-5"
+api_key_env = "ANTHROPIC_API_KEY"
+fallback = "echo"

@@ -1,10 +1,14 @@
 //! The kernel daemon — listens on a Unix domain socket and serves
 //! agent sessions to connected distro processes.
 
+mod manifest;
 mod router;
 
 use kernel_interfaces::framing::{read_message, write_message};
 use kernel_interfaces::protocol::{KernelEvent, KernelRequest};
+use kernel_interfaces::provider::ProviderInterface;
+use kernel_providers::{AnthropicProvider, EchoProvider};
+use manifest::{ProviderFactory, load_manifest};
 use router::ConnectionRouter;
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixListener;
@@ -13,7 +17,6 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse simple args
     let socket_path = args
         .iter()
         .position(|a| a == "--socket")
@@ -21,14 +24,60 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/agent-kernel-{}.sock", std::process::id())));
 
-    let model = args
+    let distro_path = args
         .iter()
-        .position(|a| a == "--model")
+        .position(|a| a == "--distro")
         .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".into());
+        .map(PathBuf::from);
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    // Build the provider factory. Two paths:
+    //  1. If --distro is set, load the manifest and derive the factory from it (preferred).
+    //  2. Otherwise fall back to the old --model + ANTHROPIC_API_KEY env var shape
+    //     (deprecated; kept so an old checkout without distros/code-agent.toml still runs).
+    let provider_factory: ProviderFactory = match distro_path {
+        Some(ref path) => {
+            let manifest = load_manifest(path).unwrap_or_else(|e| {
+                eprintln!("failed to load manifest: {e}");
+                std::process::exit(1);
+            });
+            eprintln!(
+                "distribution: {} v{}",
+                manifest.distribution.name, manifest.distribution.version
+            );
+            manifest.provider_factory().unwrap_or_else(|e| {
+                eprintln!("failed to build provider from manifest: {e}");
+                std::process::exit(1);
+            })
+        }
+        None => {
+            eprintln!(
+                "warning: --distro not set; falling back to --model + ANTHROPIC_API_KEY \
+                 env var (deprecated, will be removed)"
+            );
+            let model = args
+                .iter()
+                .position(|a| a == "--model")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+                .unwrap_or_else(|| "claude-sonnet-4-5".into());
+            let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+            match api_key {
+                Some(key) => {
+                    eprintln!("using model: {model}");
+                    std::sync::Arc::new(move || {
+                        Box::new(AnthropicProvider::new(key.clone(), model.clone()))
+                            as Box<dyn ProviderInterface + Send>
+                    })
+                }
+                None => {
+                    eprintln!("no ANTHROPIC_API_KEY — using echo provider");
+                    std::sync::Arc::new(|| {
+                        Box::new(EchoProvider) as Box<dyn ProviderInterface + Send>
+                    })
+                }
+            }
+        }
+    };
 
     // Clean up stale socket
     if socket_path.exists() {
@@ -41,11 +90,6 @@ fn main() {
     });
 
     eprintln!("kernel daemon listening on {}", socket_path.display());
-    if api_key.is_some() {
-        eprintln!("using model: {model}");
-    } else {
-        eprintln!("no ANTHROPIC_API_KEY — using echo provider");
-    }
 
     // Accept connections in a loop — when a distro disconnects,
     // go back to waiting for the next one.
@@ -79,7 +123,7 @@ fn main() {
         });
 
         // Router handles all protocol logic
-        let mut router = ConnectionRouter::new(event_tx, api_key.clone(), model.clone());
+        let mut router = ConnectionRouter::new(event_tx, provider_factory.clone());
 
         // Reader loop: reads KernelRequests from the distro
         let mut reader = BufReader::new(reader_stream);

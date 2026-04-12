@@ -15,7 +15,7 @@ use kernel_interfaces::types::SessionId;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use kernel_providers::{AnthropicProvider, EchoProvider};
+use crate::manifest::ProviderFactory;
 
 /// Per-session state tracked by the router.
 struct SessionEntry {
@@ -34,20 +34,20 @@ pub struct ConnectionRouter {
     next_session_id: u64,
     /// Channel for outgoing events to the socket writer.
     event_tx: Sender<KernelEvent>,
-    /// Provider factory config.
-    api_key: Option<String>,
-    model: String,
+    /// Provider factory. Called once per session-create to produce a
+    /// fresh `Box<dyn ProviderInterface + Send>`. Source of truth is
+    /// the distribution manifest loaded in `main.rs`.
+    provider_factory: ProviderFactory,
 }
 
 impl ConnectionRouter {
-    pub fn new(event_tx: Sender<KernelEvent>, api_key: Option<String>, model: String) -> Self {
+    pub fn new(event_tx: Sender<KernelEvent>, provider_factory: ProviderFactory) -> Self {
         Self {
             tool_schemas: Vec::new(),
             sessions: HashMap::new(),
             next_session_id: 0,
             event_tx,
-            api_key,
-            model,
+            provider_factory,
         }
     }
 
@@ -90,13 +90,9 @@ impl ConnectionRouter {
                     tools.push(Box::new(proxy));
                 }
 
-                // Create provider
-                let provider: Box<dyn ProviderInterface + Send> =
-                    if let Some(ref key) = self.api_key {
-                        Box::new(AnthropicProvider::new(key.clone(), self.model.clone()))
-                    } else {
-                        Box::new(EchoProvider)
-                    };
+                // Build a fresh provider for this session from the
+                // manifest-derived factory.
+                let provider: Box<dyn ProviderInterface + Send> = (self.provider_factory)();
 
                 // Create ProxyFrontend
                 let frontend = ProxyFrontend::new(
@@ -287,11 +283,17 @@ mod tests {
     use super::*;
     use kernel_interfaces::protocol::SessionCreateConfig;
     use kernel_interfaces::types::*;
+    use kernel_providers::EchoProvider;
+    use std::sync::Arc;
+
+    fn echo_factory() -> ProviderFactory {
+        Arc::new(|| Box::new(EchoProvider) as Box<dyn ProviderInterface + Send>)
+    }
 
     #[test]
     fn router_register_tools_and_create_session() {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        let mut router = ConnectionRouter::new(event_tx, None, "echo".into());
+        let mut router = ConnectionRouter::new(event_tx, echo_factory());
 
         // Register a tool
         router.handle_request(KernelRequest::RegisterTools {
@@ -339,7 +341,7 @@ mod tests {
     #[test]
     fn router_shutdown_returns_false() {
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
-        let mut router = ConnectionRouter::new(event_tx, None, "echo".into());
+        let mut router = ConnectionRouter::new(event_tx, echo_factory());
 
         let cont = router.handle_request(KernelRequest::Shutdown);
         assert!(!cont);
