@@ -166,22 +166,19 @@ fn main() {
                     };
                     match shell.run_streaming(&command, emit) {
                         Ok(result) => {
-                            let body = json!({
-                                "exit_code": result.exit_code,
-                                "stdout": result.stdout,
-                                "stderr": result.stderr,
-                            });
-                            send(
-                                &mut out,
-                                &ok_response(
-                                    id,
-                                    json!({
-                                        "content": [
-                                            { "type": "text", "text": body.to_string() }
-                                        ]
-                                    }),
-                                ),
-                            );
+                            let mut text = String::new();
+                            if result.exit_code != 0 {
+                                text.push_str(&format!("[exit {}] ", result.exit_code));
+                            }
+                            text.push_str(&result.stdout);
+                            if !result.stderr.is_empty() {
+                                if !text.is_empty() && !text.ends_with('\n') {
+                                    text.push('\n');
+                                }
+                                text.push_str("[stderr] ");
+                                text.push_str(&result.stderr);
+                            }
+                            send(&mut out, &ok_response(id, text_content(&text)));
                         }
                         Err(e) => {
                             send(&mut out, &err_response(id, -32000, &e));
@@ -195,17 +192,8 @@ fn main() {
                     };
                     match tool.execute(arguments, &ToolExecutionCtx::null()) {
                         Ok(output) => {
-                            send(
-                                &mut out,
-                                &ok_response(
-                                    id,
-                                    json!({
-                                        "content": [
-                                            { "type": "text", "text": output.result.to_string() }
-                                        ]
-                                    }),
-                                ),
-                            );
+                            let text = format_result_as_text(&name, &output.result);
+                            send(&mut out, &ok_response(id, text_content(&text)));
                         }
                         Err(e) => {
                             send(&mut out, &err_response(id, -32000, &e.to_string()));
@@ -256,4 +244,75 @@ fn parse_error(message: String) -> Value {
         "id": Value::Null,
         "error": { "code": -32700, "message": format!("parse error: {message}") },
     })
+}
+
+fn text_content(text: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": text }]
+    })
+}
+
+/// Format a tool result Value as human-readable text for the model.
+fn format_result_as_text(tool_name: &str, result: &Value) -> String {
+    match tool_name {
+        "file_read" => {
+            let path = result.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let content = result.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let total = result
+                .get("total_lines")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("{path} ({total} lines)\n{content}")
+        }
+        "file_write" => {
+            let path = result.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes = result
+                .get("bytes_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("Wrote {bytes} bytes to {path}")
+        }
+        "file_edit" => {
+            let path = result.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let action = result
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("edited");
+            match action {
+                "created" => format!("Created {path}"),
+                _ => format!("Edited {path}"),
+            }
+        }
+        "ls" => {
+            let path = result.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let entries = result
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            format!("{path}/\n{entries}")
+        }
+        "grep" => {
+            let matches = result.get("matches").and_then(|v| v.as_str()).unwrap_or("");
+            let total = result
+                .get("total_matches")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let truncated = result
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut out = matches.to_string();
+            if truncated {
+                out.push_str(&format!("\n... ({total} total matches, showing first 100)"));
+            }
+            out
+        }
+        _ => result.to_string(),
+    }
 }

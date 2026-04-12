@@ -235,9 +235,17 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                 Content::ToolCall { id, name, input } => serde_json::json!({
                     "type": "tool_use", "id": id, "name": name, "input": input,
                 }),
-                Content::ToolResult { id, result } => serde_json::json!({
-                    "type": "tool_result", "tool_use_id": id, "content": result.to_string(),
-                }),
+                Content::ToolResult { id, result } => {
+                    // Serialize strings as bare text, not JSON-quoted.
+                    // The Anthropic API content field accepts plain strings.
+                    let content_str = match result {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    serde_json::json!({
+                        "type": "tool_result", "tool_use_id": id, "content": content_str,
+                    })
+                }
             })
             .collect();
 

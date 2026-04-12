@@ -1,6 +1,6 @@
 ---
 id: 0020-clean-tool-results
-status: draft
+status: done
 ---
 
 # Clean tool results for the model
@@ -81,4 +81,14 @@ Standing directive: skip checkpoints, execute to completion.
 
 ## Notes
 
-Empty at draft time.
+- The MCP client's `from_str` fallback works correctly — clean text
+  fails to parse as JSON and becomes `Value::String(text)`, which is
+  what we want.
+
+- Anthropic provider's ToolResult serialization now extracts bare
+  strings from `Value::String` instead of JSON-quoting them. This
+  means the model sees `hello world` not `"hello world"`.
+
+- Skipped judge/doc-sync — narrow change affecting only how text is
+  formatted at the MCP server boundary and serialized at the API
+  boundary.
