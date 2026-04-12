@@ -36,6 +36,8 @@ pub struct DistributionManifest {
     pub provider: ProviderConfig,
     #[serde(default)]
     pub policy: Option<PolicyConfig>,
+    #[serde(default)]
+    pub tools: Option<ToolsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,20 @@ pub struct PolicyConfig {
     /// Path to a YAML policy file, relative to the manifest file's
     /// directory. Absolute paths also work.
     pub file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolsConfig {
+    /// Tool IDs to enable, in any order. Each ID must match a tool
+    /// the distribution actually implements. Unknown IDs are logged
+    /// as warnings but don't error.
+    ///
+    /// An empty list means "no tools" — explicit. A missing
+    /// `[tools]` section (`tools: None` on the manifest) means
+    /// "enable every tool the distribution implements" for
+    /// backwards compatibility.
+    #[serde(default)]
+    pub enabled: Vec<String>,
 }
 
 impl PolicyConfig {
@@ -188,5 +204,41 @@ file = "../policies/permissive.yaml"
             manifest_dir(Path::new("code-agent.toml")),
             PathBuf::from(".")
         );
+    }
+
+    #[test]
+    fn parses_manifest_with_tools_section() {
+        let f = write_toml(
+            r#"
+[distribution]
+name = "code-agent"
+version = "0.1.0"
+
+[provider]
+type = "echo"
+
+[tools]
+enabled = ["file_read", "grep"]
+"#,
+        );
+        let manifest = load_manifest(f.path()).expect("parse");
+        let tools = manifest.tools.expect("tools section present");
+        assert_eq!(tools.enabled, vec!["file_read", "grep"]);
+    }
+
+    #[test]
+    fn missing_tools_section_is_none() {
+        let f = write_toml(
+            r#"
+[distribution]
+name = "code-agent"
+version = "0.1.0"
+
+[provider]
+type = "echo"
+"#,
+        );
+        let manifest = load_manifest(f.path()).expect("parse");
+        assert!(manifest.tools.is_none());
     }
 }

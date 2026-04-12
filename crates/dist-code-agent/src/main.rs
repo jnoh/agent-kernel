@@ -186,25 +186,27 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
 
-    // Resolve the active policy. If --distro points at a manifest with a
-    // [policy] section, read the referenced YAML file. Otherwise fall
-    // back to the deprecated inline `default_policy()`.
+    // Resolve policy + tool selection from the manifest (or fall back
+    // to compiled-in defaults with a deprecation warning).
     #[allow(deprecated)]
-    let policy = match distro_path.as_ref() {
-        Some(path) => match load_policy_from_manifest(path) {
-            Ok(policy) => {
-                eprintln!("distro: loaded policy from {}", path.display());
-                policy
+    let settings = match distro_path.as_ref() {
+        Some(path) => match load_distribution_settings(path) {
+            Ok(s) => {
+                eprintln!("distro: loaded settings from {}", path.display());
+                s
             }
             Err(e) => {
-                eprintln!("distro: failed to load policy from manifest: {e}");
-                eprintln!("distro: falling back to hard-coded default_policy()");
-                default_policy()
+                eprintln!("distro: failed to load manifest: {e}");
+                eprintln!("distro: falling back to hard-coded defaults");
+                DistributionSettings::deprecated_defaults()
             }
         },
         None => {
-            eprintln!("warning: --distro not set; using deprecated hard-coded default_policy()");
-            default_policy()
+            eprintln!(
+                "warning: --distro not set; using deprecated hard-coded defaults \
+                 (provider/policy/tools)"
+            );
+            DistributionSettings::deprecated_defaults()
         }
     };
 
@@ -239,30 +241,60 @@ fn main() {
     };
 
     if repl_mode {
-        run_repl(&socket_path, &workspace, policy);
+        run_repl(&socket_path, &workspace, settings);
     } else {
-        run_tui(&socket_path, &workspace, policy);
+        run_tui(&socket_path, &workspace, settings);
     }
 }
 
-/// Load a policy from a distribution manifest's `[policy]` section.
-/// Returns a human-readable error if the manifest can't be parsed, has
-/// no policy section, or the referenced YAML file is unreadable.
-fn load_policy_from_manifest(
+/// Config values derived from the distribution manifest (or from the
+/// deprecated compiled-in defaults when no `--distro` is given).
+struct DistributionSettings {
+    policy: kernel_interfaces::policy::Policy,
+    /// `None` means "use every tool the distribution implements".
+    /// `Some(ids)` filters to the named set.
+    enabled_tools: Option<Vec<String>>,
+}
+
+impl DistributionSettings {
+    #[deprecated(note = "temporary shim while we migrate to manifest-driven config (spec 0013)")]
+    #[allow(deprecated)]
+    fn deprecated_defaults() -> Self {
+        Self {
+            policy: default_policy(),
+            enabled_tools: None,
+        }
+    }
+}
+
+/// Load a full `DistributionSettings` from a manifest file: policy YAML
+/// resolved against the manifest directory, plus the `[tools]` enabled
+/// list if present. Returns an error string if any step fails.
+fn load_distribution_settings(
     manifest_path: &std::path::Path,
-) -> Result<kernel_interfaces::policy::Policy, String> {
+) -> Result<DistributionSettings, String> {
     let manifest = kernel_interfaces::manifest::load_manifest(manifest_path)?;
-    let policy_cfg = manifest
-        .policy
-        .as_ref()
-        .ok_or_else(|| "manifest has no [policy] section".to_string())?;
     let manifest_dir = kernel_interfaces::manifest::manifest_dir(manifest_path);
-    let policy_path = policy_cfg.resolve(&manifest_dir);
-    let yaml = std::fs::read_to_string(&policy_path)
-        .map_err(|e| format!("failed to read policy file {}: {e}", policy_path.display()))?;
-    let policy: kernel_interfaces::policy::Policy = serde_yaml::from_str(&yaml)
-        .map_err(|e| format!("failed to parse policy file {}: {e}", policy_path.display()))?;
-    Ok(policy)
+
+    let policy = match manifest.policy.as_ref() {
+        Some(cfg) => {
+            let path = cfg.resolve(&manifest_dir);
+            let yaml = std::fs::read_to_string(&path)
+                .map_err(|e| format!("failed to read policy file {}: {e}", path.display()))?;
+            serde_yaml::from_str::<kernel_interfaces::policy::Policy>(&yaml)
+                .map_err(|e| format!("failed to parse policy file {}: {e}", path.display()))?
+        }
+        None => {
+            return Err("manifest has no [policy] section".into());
+        }
+    };
+
+    let enabled_tools = manifest.tools.as_ref().map(|t| t.enabled.clone());
+
+    Ok(DistributionSettings {
+        policy,
+        enabled_tools,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -380,10 +412,11 @@ fn connect_and_setup(
 fn run_tui(
     socket_path: &std::path::Path,
     workspace: &std::path::Path,
-    initial_policy: kernel_interfaces::policy::Policy,
+    settings: DistributionSettings,
 ) {
-    let local_tools = tools::create_tools(workspace);
-    let mut current_policy = initial_policy;
+    let enabled_tools = settings.enabled_tools;
+    let local_tools = tools::create_tools(workspace, enabled_tools.as_deref());
+    let mut current_policy = settings.policy;
     let conn = connect_and_setup(socket_path, workspace, &local_tools, current_policy.clone());
     let writer = conn.writer;
 
@@ -392,7 +425,7 @@ fn run_tui(
 
     // Spawn reader thread that receives KernelEvents and executes tools
     let writer_for_reader = writer.clone();
-    let local_tools_for_reader = tools::create_tools(workspace);
+    let local_tools_for_reader = tools::create_tools(workspace, enabled_tools.as_deref());
     std::thread::spawn(move || {
         let mut reader = conn.reader;
         loop {
@@ -823,11 +856,12 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
 fn run_repl(
     socket_path: &std::path::Path,
     workspace: &std::path::Path,
-    policy: kernel_interfaces::policy::Policy,
+    settings: DistributionSettings,
 ) {
-    let local_tools = tools::create_tools(workspace);
+    let enabled_tools = settings.enabled_tools;
+    let local_tools = tools::create_tools(workspace, enabled_tools.as_deref());
     let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
-    let conn = connect_and_setup(socket_path, workspace, &local_tools, policy);
+    let conn = connect_and_setup(socket_path, workspace, &local_tools, settings.policy);
     let writer = conn.writer;
 
     eprintln!("agent-kernel v0.1.0 — code-agent distribution (IPC client)");
@@ -836,7 +870,7 @@ fn run_repl(
     eprintln!("---");
 
     let writer_for_reader = writer.clone();
-    let local_tools_for_reader = tools::create_tools(workspace);
+    let local_tools_for_reader = tools::create_tools(workspace, enabled_tools.as_deref());
     let reader_handle = std::thread::spawn(move || {
         let mut reader = conn.reader;
         loop {

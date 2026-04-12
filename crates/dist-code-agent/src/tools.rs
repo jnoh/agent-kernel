@@ -590,14 +590,92 @@ pub fn to_schema(tool: &dyn ToolRegistration) -> kernel_interfaces::protocol::To
     }
 }
 
-/// Create all distribution tools for the given workspace.
-pub fn create_tools(workspace: &Path) -> Vec<Box<dyn ToolRegistration>> {
-    vec![
-        Box::new(FileReadTool::new(workspace.to_path_buf())),
-        Box::new(FileWriteTool::new(workspace.to_path_buf())),
-        Box::new(FileEditTool::new(workspace.to_path_buf())),
-        Box::new(ShellTool::new(workspace.to_path_buf())),
-        Box::new(LsTool::new(workspace.to_path_buf())),
-        Box::new(GrepTool::new(workspace.to_path_buf())),
-    ]
+/// All tool IDs the `dist-code-agent` distribution implements.
+/// Used as the default enable list when the distribution manifest
+/// has no `[tools]` section.
+pub const TOOL_IDS: &[&str] = &[
+    "file_read",
+    "file_write",
+    "file_edit",
+    "shell",
+    "ls",
+    "grep",
+];
+
+/// Create distribution tools for the given workspace, filtered to the
+/// set of IDs the caller names.
+///
+/// - `enabled = None` → every tool in `TOOL_IDS` (backwards-compat default).
+/// - `enabled = Some(&[])` → no tools at all. Explicit.
+/// - `enabled = Some(&["file_read", "grep"])` → only those two.
+///
+/// Unknown IDs log a stderr warning and are otherwise ignored.
+pub fn create_tools(
+    workspace: &Path,
+    enabled: Option<&[String]>,
+) -> Vec<Box<dyn ToolRegistration>> {
+    let ws = workspace.to_path_buf();
+
+    let build_all: Vec<Box<dyn ToolRegistration>> = vec![
+        Box::new(FileReadTool::new(ws.clone())),
+        Box::new(FileWriteTool::new(ws.clone())),
+        Box::new(FileEditTool::new(ws.clone())),
+        Box::new(ShellTool::new(ws.clone())),
+        Box::new(LsTool::new(ws.clone())),
+        Box::new(GrepTool::new(ws)),
+    ];
+
+    match enabled {
+        None => build_all,
+        Some(ids) => {
+            // Warn on unknown IDs so typos in the manifest are visible.
+            for id in ids {
+                if !TOOL_IDS.contains(&id.as_str()) {
+                    eprintln!(
+                        "warning: manifest lists unknown tool id {id:?}; known IDs are {TOOL_IDS:?}"
+                    );
+                }
+            }
+            build_all
+                .into_iter()
+                .filter(|tool| ids.iter().any(|id| id == tool.name()))
+                .collect()
+        }
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn none_enables_every_tool() {
+        let tools = create_tools(&PathBuf::from("/tmp"), None);
+        assert_eq!(tools.len(), TOOL_IDS.len());
+    }
+
+    #[test]
+    fn empty_list_disables_everything() {
+        let tools = create_tools(&PathBuf::from("/tmp"), Some(&[]));
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn filter_narrows_to_named_tools() {
+        let enabled: Vec<String> = vec!["file_read".into(), "grep".into()];
+        let tools = create_tools(&PathBuf::from("/tmp"), Some(&enabled));
+        assert_eq!(tools.len(), 2);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"grep"));
+    }
+
+    #[test]
+    fn unknown_id_is_warned_and_dropped() {
+        let enabled: Vec<String> = vec!["file_read".into(), "doesnt_exist".into()];
+        let tools = create_tools(&PathBuf::from("/tmp"), Some(&enabled));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "file_read");
+    }
 }
