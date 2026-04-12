@@ -1,5 +1,4 @@
 mod prompt;
-mod tools;
 mod tui;
 
 use kernel_interfaces::framing::{read_message, write_message};
@@ -258,11 +257,13 @@ fn main() {
 
 /// Config values derived from the distribution manifest (or from the
 /// deprecated compiled-in defaults when no `--distro` is given).
+///
+/// As of spec 0015 the distro no longer configures tools — the kernel
+/// owns tool lifecycle via `[[toolset]]` manifest entries. This struct
+/// only carries things the distro still cares about (policy for session
+/// creation, frontend kind for dispatch).
 struct DistributionSettings {
     policy: kernel_interfaces::policy::Policy,
-    /// `None` means "use every tool the distribution implements".
-    /// `Some(ids)` filters to the named set.
-    enabled_tools: Option<Vec<String>>,
     frontend: kernel_interfaces::manifest::FrontendKind,
 }
 
@@ -272,16 +273,14 @@ impl DistributionSettings {
     fn deprecated_defaults() -> Self {
         Self {
             policy: default_policy(),
-            enabled_tools: None,
             frontend: kernel_interfaces::manifest::FrontendKind::Tui,
         }
     }
 }
 
 /// Load a full `DistributionSettings` from a manifest file: policy YAML
-/// resolved against the manifest directory, plus the `[tools]` enabled
-/// list and `[frontend]` kind if present. Returns an error string if
-/// any step fails.
+/// resolved against the manifest directory, plus `[frontend]` kind if
+/// present. Returns an error string if any step fails.
 fn load_distribution_settings(
     manifest_path: &std::path::Path,
 ) -> Result<DistributionSettings, String> {
@@ -301,19 +300,13 @@ fn load_distribution_settings(
         }
     };
 
-    let enabled_tools = manifest.tools.as_ref().map(|t| t.enabled.clone());
-
     let frontend = manifest
         .frontend
         .as_ref()
         .map(|f| f.kind)
         .unwrap_or(kernel_interfaces::manifest::FrontendKind::Tui);
 
-    Ok(DistributionSettings {
-        policy,
-        enabled_tools,
-        frontend,
-    })
+    Ok(DistributionSettings { policy, frontend })
 }
 
 // ---------------------------------------------------------------------------
@@ -371,7 +364,6 @@ fn prepend_allow_rule(policy: &mut kernel_interfaces::policy::Policy, capabiliti
 fn connect_and_setup(
     socket_path: &std::path::Path,
     workspace: &std::path::Path,
-    local_tools: &[Box<dyn kernel_interfaces::tool::ToolRegistration>],
     policy: kernel_interfaces::policy::Policy,
 ) -> DaemonConnection {
     let stream = UnixStream::connect(socket_path).unwrap_or_else(|e| {
@@ -384,23 +376,19 @@ fn connect_and_setup(
 
     let writer = std::sync::Arc::new(std::sync::Mutex::new(BufWriter::new(write_stream)));
 
-    let tool_schemas: Vec<_> = local_tools
+    // Since spec 0015 the distro doesn't know the kernel's tool list
+    // directly — the daemon owns the toolset pool. For system-prompt
+    // display we use the fixed name list exported by the first-party
+    // workspace toolset, which is what every `distros/code-agent.toml`
+    // ships by default. When multi-toolset distros arrive, this will
+    // become a protocol call or a manifest-mirror read.
+    let tool_names: Vec<String> = kernel_workspace_local::TOOL_NAMES
         .iter()
-        .map(|t| tools::to_schema(t.as_ref()))
+        .map(|s| (*s).to_string())
         .collect();
-
-    let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
 
     {
         let mut w = writer.lock().unwrap();
-        write_message(
-            &mut *w,
-            &KernelRequest::RegisterTools {
-                tools: tool_schemas,
-            },
-        )
-        .expect("send RegisterTools");
-
         write_message(
             &mut *w,
             &KernelRequest::CreateSession {
@@ -408,7 +396,7 @@ fn connect_and_setup(
                     mode: SessionMode::Interactive,
                     system_prompt: prompt::build_system_prompt(&prompt::PromptContext {
                         workspace: workspace.display().to_string(),
-                        tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
+                        tool_names,
                     }),
                     completion_config: CompletionConfig::default(),
                     policy,
@@ -433,18 +421,17 @@ fn run_tui(
     workspace: &std::path::Path,
     settings: DistributionSettings,
 ) {
-    let enabled_tools = settings.enabled_tools;
-    let local_tools = tools::create_tools(workspace, enabled_tools.as_deref());
     let mut current_policy = settings.policy;
-    let conn = connect_and_setup(socket_path, workspace, &local_tools, current_policy.clone());
+    let conn = connect_and_setup(socket_path, workspace, current_policy.clone());
     let writer = conn.writer;
 
     // Channel: reader thread sends KernelEvents to the TUI main loop
     let (event_tx, event_rx) = mpsc::channel::<KernelEvent>();
 
-    // Spawn reader thread that receives KernelEvents and executes tools
-    let writer_for_reader = writer.clone();
-    let local_tools_for_reader = tools::create_tools(workspace, enabled_tools.as_deref());
+    // Spawn reader thread that forwards KernelEvents to the TUI.
+    // Spec 0015: the distro no longer executes tools — the daemon
+    // owns tool dispatch via its ToolsetPool — so the reader is a
+    // pure pass-through.
     std::thread::spawn(move || {
         let mut reader = conn.reader;
         loop {
@@ -463,57 +450,7 @@ fn run_tui(
                     break;
                 }
             };
-
-            // Handle tool execution on this thread, but also forward the
-            // event to the TUI for display.
-            match &kernel_event {
-                KernelEvent::ExecuteTool {
-                    request_id,
-                    tool_name,
-                    input,
-                    session_id,
-                } => {
-                    // Forward to TUI to show Running entry
-                    let _ = event_tx.send(kernel_event.clone());
-
-                    let (result, invalidations) = if let Some(tool) = local_tools_for_reader
-                        .iter()
-                        .find(|t| t.name() == tool_name)
-                    {
-                        match tool.execute(input.clone()) {
-                            Ok(output) => (output.result, output.invalidations),
-                            Err(e) => (serde_json::json!({"error": e.to_string()}), vec![]),
-                        }
-                    } else {
-                        (
-                            serde_json::json!({"error": "tool not found", "name": tool_name}),
-                            vec![],
-                        )
-                    };
-
-                    // Send result summary to TUI via ToolCallStarted
-                    // (repurposed as "tool completed" notification)
-                    let result_summary = format_tool_result(tool_name, &result);
-                    let _ = event_tx.send(KernelEvent::ToolCallStarted {
-                        session_id: *session_id,
-                        tool_name: tool_name.clone(),
-                        input: serde_json::json!({ "__result": result_summary }),
-                    });
-
-                    let mut w = writer_for_reader.lock().unwrap();
-                    let _ = write_message(
-                        &mut *w,
-                        &KernelRequest::ToolResult {
-                            request_id: *request_id,
-                            result,
-                            invalidations,
-                        },
-                    );
-                }
-                _ => {
-                    let _ = event_tx.send(kernel_event);
-                }
-            }
+            let _ = event_tx.send(kernel_event);
         }
     });
 
@@ -754,7 +691,7 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             app.scroll_to_bottom();
         }
 
-        KernelEvent::ExecuteTool {
+        KernelEvent::ToolCallStarted {
             tool_name, input, ..
         } => {
             app.entries.push(tui::ConversationEntry::ToolCall {
@@ -766,37 +703,27 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             app.scroll_to_bottom();
         }
 
-        KernelEvent::ToolCallStarted {
-            tool_name, input, ..
+        KernelEvent::ToolCompleted {
+            tool_name, result, ..
         } => {
-            // Check if this is a result notification (from our reader thread)
-            if let Some(result_str) = input.get("__result").and_then(|v| v.as_str()) {
-                // Find the matching Running entry and update it with the result
-                for entry in app.entries.iter_mut().rev() {
-                    if let tui::ConversationEntry::ToolCall {
-                        tool_name: n,
-                        status,
-                        result_summary,
-                        ..
-                    } = entry
-                        && n == tool_name
-                        && let tui::ToolCallStatus::Running(start) = status
-                    {
-                        let duration = start.elapsed();
-                        *status = tui::ToolCallStatus::Success(duration);
-                        *result_summary = Some(result_str.to_string());
-                        break;
-                    }
+            let summary = format_tool_result(tool_name, result);
+            for entry in app.entries.iter_mut().rev() {
+                if let tui::ConversationEntry::ToolCall {
+                    tool_name: n,
+                    status,
+                    result_summary,
+                    ..
+                } = entry
+                    && n == tool_name
+                    && let tui::ToolCallStatus::Running(start) = status
+                {
+                    let duration = start.elapsed();
+                    *status = tui::ToolCallStatus::Success(duration);
+                    *result_summary = Some(summary);
+                    break;
                 }
-                app.scroll_to_bottom();
-                return;
             }
-
-            // Normal ToolCallStarted from daemon — ignored because
-            // ExecuteTool already creates the entry.
-            {
-                app.scroll_to_bottom();
-            }
+            app.scroll_to_bottom();
         }
 
         KernelEvent::PermissionRequired {
@@ -877,19 +804,15 @@ fn run_repl(
     workspace: &std::path::Path,
     settings: DistributionSettings,
 ) {
-    let enabled_tools = settings.enabled_tools;
-    let local_tools = tools::create_tools(workspace, enabled_tools.as_deref());
-    let tool_names: Vec<&str> = local_tools.iter().map(|t| t.name()).collect();
-    let conn = connect_and_setup(socket_path, workspace, &local_tools, settings.policy);
+    let conn = connect_and_setup(socket_path, workspace, settings.policy);
     let writer = conn.writer;
 
     eprintln!("agent-kernel v0.1.0 — code-agent distribution (IPC client)");
     eprintln!("Workspace: {}", workspace.display());
-    eprintln!("Tools: {}", tool_names.join(", "));
+    eprintln!("Tools: {}", kernel_workspace_local::TOOL_NAMES.join(", "));
     eprintln!("---");
 
     let writer_for_reader = writer.clone();
-    let local_tools_for_reader = tools::create_tools(workspace, enabled_tools.as_deref());
     let reader_handle = std::thread::spawn(move || {
         let mut reader = conn.reader;
         loop {
@@ -908,45 +831,20 @@ fn run_repl(
                     eprintln!("Session {session_id:?} created");
                 }
 
-                KernelEvent::ExecuteTool {
-                    request_id,
-                    tool_name,
-                    input,
-                    ..
+                KernelEvent::ToolCallStarted {
+                    tool_name, input, ..
                 } => {
                     eprintln!(
                         "  [tool] {tool_name}({})",
                         format_tool_input(&tool_name, &input)
                     );
+                }
 
-                    let (result, invalidations) = if let Some(tool) = local_tools_for_reader
-                        .iter()
-                        .find(|t| t.name() == tool_name)
-                    {
-                        match tool.execute(input) {
-                            Ok(output) => {
-                                let display = format_tool_result(&tool_name, &output.result);
-                                eprintln!("  [result] {tool_name} -> {display}");
-                                (output.result, output.invalidations)
-                            }
-                            Err(e) => (serde_json::json!({"error": e.to_string()}), vec![]),
-                        }
-                    } else {
-                        (
-                            serde_json::json!({"error": "tool not found", "name": tool_name}),
-                            vec![],
-                        )
-                    };
-
-                    let mut w = writer_for_reader.lock().unwrap();
-                    let _ = write_message(
-                        &mut *w,
-                        &KernelRequest::ToolResult {
-                            request_id,
-                            result,
-                            invalidations,
-                        },
-                    );
+                KernelEvent::ToolCompleted {
+                    tool_name, result, ..
+                } => {
+                    let display = format_tool_result(&tool_name, &result);
+                    eprintln!("  [result] {tool_name} -> {display}");
                 }
 
                 KernelEvent::PermissionRequired {
@@ -986,8 +884,6 @@ fn run_repl(
                 KernelEvent::TextOutput { text, .. } => {
                     println!("{text}");
                 }
-
-                KernelEvent::ToolCallStarted { .. } => {}
 
                 KernelEvent::TurnStarted { .. } => {}
 

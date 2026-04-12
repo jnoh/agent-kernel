@@ -31,15 +31,19 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DistributionManifest {
     pub distribution: DistributionMeta,
     pub provider: ProviderConfig,
     #[serde(default)]
     pub policy: Option<PolicyConfig>,
     #[serde(default)]
-    pub tools: Option<ToolsConfig>,
-    #[serde(default)]
     pub frontend: Option<FrontendConfig>,
+    /// Toolset entries. Each entry names a `kind` the kernel dispatches
+    /// on (via a factory registry), plus an opaque `config` block passed
+    /// through to the factory. Empty = no toolsets.
+    #[serde(default, rename = "toolset")]
+    pub toolsets: Vec<ToolsetEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,18 +90,37 @@ pub struct FrontendConfig {
     pub kind: FrontendKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ToolsConfig {
-    /// Tool IDs to enable, in any order. Each ID must match a tool
-    /// the distribution actually implements. Unknown IDs are logged
-    /// as warnings but don't error.
-    ///
-    /// An empty list means "no tools" — explicit. A missing
-    /// `[tools]` section (`tools: None` on the manifest) means
-    /// "enable every tool the distribution implements" for
-    /// backwards compatibility.
+/// One `[[toolset]]` entry from the distribution manifest.
+///
+/// `kind` is routed through a factory registry in the daemon; the
+/// `config` block is opaque at parse time and forwarded to whichever
+/// factory matches. `id` is optional — if absent, the factory picks a
+/// sensible default (typically derived from `kind`).
+///
+/// Example manifest TOML:
+///
+/// ```toml
+/// [[toolset]]
+/// kind = "workspace.local"
+/// id = "workspace"
+/// [toolset.config]
+/// root = "."
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolsetEntry {
+    pub kind: String,
     #[serde(default)]
-    pub enabled: Vec<String>,
+    pub id: Option<String>,
+    /// Opaque per-toolset configuration. The kernel does not interpret
+    /// this; it is passed through to the factory for `kind`. Defaults
+    /// to an empty TOML table so `config.get(...)` works whether or not
+    /// the manifest included a `[toolset.config]` block.
+    #[serde(default = "empty_toml_table")]
+    pub config: toml::Value,
+}
+
+fn empty_toml_table() -> toml::Value {
+    toml::Value::Table(toml::value::Table::new())
 }
 
 impl PolicyConfig {
@@ -222,7 +245,59 @@ file = "../policies/permissive.yaml"
     }
 
     #[test]
-    fn parses_manifest_with_tools_section() {
+    fn parses_manifest_with_toolset_section() {
+        let f = write_toml(
+            r#"
+[distribution]
+name = "code-agent"
+version = "0.1.0"
+
+[provider]
+type = "echo"
+
+[[toolset]]
+kind = "workspace.local"
+id = "workspace"
+[toolset.config]
+root = "."
+"#,
+        );
+        let manifest = load_manifest(f.path()).expect("parse");
+        assert_eq!(manifest.toolsets.len(), 1);
+        let entry = &manifest.toolsets[0];
+        assert_eq!(entry.kind, "workspace.local");
+        assert_eq!(entry.id.as_deref(), Some("workspace"));
+        assert_eq!(entry.config.get("root").and_then(|v| v.as_str()), Some("."));
+    }
+
+    #[test]
+    fn parses_manifest_with_multiple_toolsets() {
+        let f = write_toml(
+            r#"
+[distribution]
+name = "code-agent"
+version = "0.1.0"
+
+[provider]
+type = "echo"
+
+[[toolset]]
+kind = "workspace.local"
+
+[[toolset]]
+kind = "mcp.stdio"
+id = "github"
+"#,
+        );
+        let manifest = load_manifest(f.path()).expect("parse");
+        assert_eq!(manifest.toolsets.len(), 2);
+        assert_eq!(manifest.toolsets[0].kind, "workspace.local");
+        assert_eq!(manifest.toolsets[1].kind, "mcp.stdio");
+        assert_eq!(manifest.toolsets[1].id.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn legacy_tools_section_fails_to_parse() {
         let f = write_toml(
             r#"
 [distribution]
@@ -233,12 +308,13 @@ version = "0.1.0"
 type = "echo"
 
 [tools]
-enabled = ["file_read", "grep"]
+enabled = ["file_read"]
 "#,
         );
-        let manifest = load_manifest(f.path()).expect("parse");
-        let tools = manifest.tools.expect("tools section present");
-        assert_eq!(tools.enabled, vec!["file_read", "grep"]);
+        assert!(
+            load_manifest(f.path()).is_err(),
+            "legacy [tools] section should be rejected by deny_unknown_fields"
+        );
     }
 
     #[test]
@@ -286,7 +362,7 @@ type = "repl"
     }
 
     #[test]
-    fn missing_tools_section_is_none() {
+    fn missing_toolset_section_is_empty_vec() {
         let f = write_toml(
             r#"
 [distribution]
@@ -298,6 +374,6 @@ type = "echo"
 "#,
         );
         let manifest = load_manifest(f.path()).expect("parse");
-        assert!(manifest.tools.is_none());
+        assert!(manifest.toolsets.is_empty());
     }
 }

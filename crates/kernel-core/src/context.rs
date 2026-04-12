@@ -1225,7 +1225,11 @@ mod tests {
             fn relevance(&self) -> &RelevanceSignal {
                 &self.relevance
             }
-            fn execute(&self, _: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            fn execute(
+                &self,
+                _: serde_json::Value,
+                _: &kernel_interfaces::tool::ToolExecutionCtx<'_>,
+            ) -> Result<ToolOutput, ToolError> {
                 unreachable!()
             }
         }

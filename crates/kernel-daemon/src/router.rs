@@ -1,18 +1,22 @@
 //! Connection router — dispatches protocol messages between the socket and
 //! per-session EventLoops.
+//!
+//! As of spec 0015, tool dispatch is entirely kernel-side. The router does
+//! not accept tool schemas from the distro; instead it snapshots a fresh
+//! tool list from the shared `ToolsetPool` at every `CreateSession` call.
 
+use crate::toolset_pool::ToolsetPool;
 use crossbeam_channel::Sender;
 use kernel_core::event_loop::{EventLoop, EventLoopConfig};
 use kernel_core::proxy_frontend::ProxyFrontend;
-use kernel_core::proxy_tool::{ProxyTool, ToolResponse};
 use kernel_core::session_events::{
     FileSink, HttpSink, NullSink, SessionEventSink, TeeSink, default_events_path,
 };
-use kernel_interfaces::protocol::{KernelEvent, KernelRequest, ToolSchema};
+use kernel_interfaces::protocol::{KernelEvent, KernelRequest};
 use kernel_interfaces::provider::ProviderInterface;
-use kernel_interfaces::tool::ToolRegistration;
 use kernel_interfaces::types::SessionId;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::manifest::ProviderFactory;
@@ -20,16 +24,13 @@ use crate::manifest::ProviderFactory;
 /// Per-session state tracked by the router.
 struct SessionEntry {
     input_tx: Sender<KernelRequest>,
-    /// Per-tool response channels keyed by tool name.
-    /// Each ProxyTool gets its own response channel.
-    tool_response_txs: HashMap<String, Sender<ToolResponse>>,
     /// Permission response channel for the ProxyFrontend.
     permission_tx: Sender<kernel_core::proxy_frontend::PermissionResponse>,
 }
 
-/// The connection router manages sessions, routes messages, and owns the provider.
+/// The connection router manages sessions, routes messages, and owns the
+/// provider factory + toolset pool.
 pub struct ConnectionRouter {
-    tool_schemas: Vec<ToolSchema>,
     sessions: HashMap<SessionId, SessionEntry>,
     next_session_id: u64,
     /// Channel for outgoing events to the socket writer.
@@ -38,57 +39,42 @@ pub struct ConnectionRouter {
     /// fresh `Box<dyn ProviderInterface + Send>`. Source of truth is
     /// the distribution manifest loaded in `main.rs`.
     provider_factory: ProviderFactory,
+    /// Shared toolset pool. Daemon-scoped; each `CreateSession` snapshots
+    /// a fresh tool list via `pool.tools_for_session()`.
+    toolset_pool: Arc<ToolsetPool>,
 }
 
 impl ConnectionRouter {
-    pub fn new(event_tx: Sender<KernelEvent>, provider_factory: ProviderFactory) -> Self {
+    pub fn new(
+        event_tx: Sender<KernelEvent>,
+        provider_factory: ProviderFactory,
+        toolset_pool: Arc<ToolsetPool>,
+    ) -> Self {
         Self {
-            tool_schemas: Vec::new(),
             sessions: HashMap::new(),
             next_session_id: 0,
             event_tx,
             provider_factory,
+            toolset_pool,
         }
     }
 
     /// Handle an incoming request from the distro.
     pub fn handle_request(&mut self, request: KernelRequest) -> bool {
         match request {
-            KernelRequest::RegisterTools { tools } => {
-                eprintln!("  registered {} tools", tools.len());
-                self.tool_schemas = tools;
-            }
-
             KernelRequest::CreateSession { config } => {
                 let session_id = SessionId(self.next_session_id);
+                let tools = self.toolset_pool.tools_for_session();
                 eprintln!(
-                    "  creating session {:?} with {} tools",
+                    "  creating session {:?} with {} tools (from pool)",
                     session_id,
-                    self.tool_schemas.len()
+                    tools.len()
                 );
                 self.next_session_id += 1;
 
                 // Create per-session channels
                 let (input_tx, input_rx) = crossbeam_channel::unbounded();
                 let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
-
-                // Create ProxyTools from registered schemas
-                let mut tools: Vec<Box<dyn ToolRegistration>> = Vec::new();
-                let mut tool_response_txs = HashMap::new();
-
-                for schema in &self.tool_schemas {
-                    let (response_tx, response_rx) = crossbeam_channel::unbounded();
-                    tool_response_txs.insert(schema.name.clone(), response_tx);
-
-                    let proxy = ProxyTool::new(
-                        schema.clone(),
-                        session_id,
-                        self.event_tx.clone(),
-                        response_rx,
-                        Duration::from_secs(120),
-                    );
-                    tools.push(Box::new(proxy));
-                }
 
                 // Build a fresh provider for this session from the
                 // manifest-derived factory.
@@ -165,7 +151,6 @@ impl ConnectionRouter {
                     session_id,
                     SessionEntry {
                         input_tx,
-                        tool_response_txs,
                         permission_tx,
                     },
                 );
@@ -195,26 +180,6 @@ impl ConnectionRouter {
                     let _ = entry
                         .input_tx
                         .send(KernelRequest::DeliverEvent { session_id, event });
-                }
-            }
-
-            KernelRequest::ToolResult {
-                request_id,
-                result,
-                invalidations,
-            } => {
-                // Route the tool result to the correct ProxyTool.
-                // We need to find which session/tool this request_id belongs to.
-                // For now, broadcast to all sessions — the ProxyTool will match
-                // on its own channel. In production, we'd track request_id → session.
-                for entry in self.sessions.values() {
-                    for tx in entry.tool_response_txs.values() {
-                        let _ = tx.send(ToolResponse {
-                            request_id,
-                            result: result.clone(),
-                            invalidations: invalidations.clone(),
-                        });
-                    }
                 }
             }
 
@@ -281,36 +246,31 @@ impl ConnectionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel_interfaces::manifest::ToolsetEntry;
     use kernel_interfaces::protocol::SessionCreateConfig;
     use kernel_interfaces::types::*;
     use kernel_providers::EchoProvider;
-    use std::sync::Arc;
 
     fn echo_factory() -> ProviderFactory {
         Arc::new(|| Box::new(EchoProvider) as Box<dyn ProviderInterface + Send>)
     }
 
+    fn empty_pool() -> Arc<ToolsetPool> {
+        Arc::new(
+            ToolsetPool::build(
+                &[] as &[ToolsetEntry],
+                &crate::toolset_pool::default_registry(),
+            )
+            .expect("empty pool"),
+        )
+    }
+
     #[test]
-    fn router_register_tools_and_create_session() {
+    fn router_create_session_without_register_tools() {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        let mut router = ConnectionRouter::new(event_tx, echo_factory());
+        let mut router = ConnectionRouter::new(event_tx, echo_factory(), empty_pool());
 
-        // Register a tool
-        router.handle_request(KernelRequest::RegisterTools {
-            tools: vec![ToolSchema {
-                name: "file_read".into(),
-                description: "Read a file".into(),
-                capabilities: std::collections::HashSet::new(),
-                schema: serde_json::json!({"type": "object"}),
-                cost: TokenEstimate(100),
-                relevance: RelevanceSignal {
-                    keywords: vec![],
-                    tags: vec![],
-                },
-            }],
-        });
-
-        // Create a session
+        // Create a session directly — no RegisterTools step required.
         router.handle_request(KernelRequest::CreateSession {
             config: SessionCreateConfig {
                 mode: SessionMode::Interactive,
@@ -341,7 +301,7 @@ mod tests {
     #[test]
     fn router_shutdown_returns_false() {
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
-        let mut router = ConnectionRouter::new(event_tx, echo_factory());
+        let mut router = ConnectionRouter::new(event_tx, echo_factory(), empty_pool());
 
         let cont = router.handle_request(KernelRequest::Shutdown);
         assert!(!cont);

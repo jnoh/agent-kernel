@@ -88,9 +88,15 @@ impl FrontendEvents for ProxyFrontend {
         });
     }
 
-    fn on_tool_result(&self, _tool_name: &str, _result: &ToolOutput) {
-        // Tool results are communicated via the ProxyTool response channel,
-        // not through the frontend. This is intentionally a no-op.
+    fn on_tool_result(&self, tool_name: &str, result: &ToolOutput) {
+        // Since spec 0015, the kernel owns tool dispatch — the frontend
+        // is not running tools itself, so it needs a direct notification
+        // when a tool completes so it can render a display summary.
+        self.send(KernelEvent::ToolCompleted {
+            session_id: self.session_id,
+            tool_name: tool_name.to_string(),
+            result: result.result.clone(),
+        });
     }
 
     fn on_permission_request(&self, request: &PermissionRequest) -> Decision {

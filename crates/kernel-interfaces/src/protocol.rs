@@ -2,35 +2,24 @@
 //!
 //! The kernel daemon and distro processes communicate via length-prefixed JSON
 //! messages over a Unix domain socket. This module defines all message types.
+//!
+//! As of spec 0015, tool dispatch is entirely kernel-side — the distro does
+//! not register tools, does not execute tools, and never sees tool I/O on
+//! this protocol. Tools live in `[[toolset]]` entries in the distribution
+//! manifest and are owned by the daemon's `ToolsetPool`.
 
 use crate::channel::ExternalEvent;
 use crate::frontend::{CompactionSummary, KernelError, PermissionRequest};
 use crate::policy::Policy;
-use crate::types::{
-    CapabilitySet, CompletionConfig, Decision, Invalidation, RelevanceSignal, ResourceBudget,
-    SessionId, SessionMode, TokenEstimate, TurnId,
-};
+use crate::types::{CompletionConfig, Decision, ResourceBudget, SessionId, SessionMode, TurnId};
 use serde::{Deserialize, Serialize};
 
-/// Correlates async request/response pairs (tool execution, permission).
+/// Correlates async request/response pairs (permission prompts, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId(pub u64);
 
-/// The serializable subset of ToolRegistration — everything except execute().
-/// Sent by the distro during tool registration; used by the kernel to build
-/// ProxyTool instances.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSchema {
-    pub name: String,
-    pub description: String,
-    pub capabilities: CapabilitySet,
-    pub schema: serde_json::Value,
-    pub cost: TokenEstimate,
-    pub relevance: RelevanceSignal,
-}
-
 /// Configuration for creating a new session, sent by the distro.
-/// The distro does not configure the provider — the kernel owns that.
+/// The distro does not configure the provider or tools — the kernel owns both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateConfig {
     pub mode: SessionMode,
@@ -60,10 +49,6 @@ pub struct TurnResultSummary {
 /// Messages sent from the distro to the kernel daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KernelRequest {
-    /// Register tools that the distro can execute.
-    /// Must be sent before CreateSession.
-    RegisterTools { tools: Vec<ToolSchema> },
-
     /// Create a new session with the given configuration.
     CreateSession { config: SessionCreateConfig },
 
@@ -74,13 +59,6 @@ pub enum KernelRequest {
     DeliverEvent {
         session_id: SessionId,
         event: ExternalEvent,
-    },
-
-    /// Return the result of a tool execution requested by the kernel.
-    ToolResult {
-        request_id: RequestId,
-        result: serde_json::Value,
-        invalidations: Vec<Invalidation>,
     },
 
     /// Respond to a permission request from the kernel.
@@ -118,15 +96,6 @@ pub enum KernelEvent {
     /// A new session was created.
     SessionCreated { session_id: SessionId },
 
-    /// The kernel requests the distro to execute a tool.
-    /// The distro must respond with a ToolResult KernelRequest.
-    ExecuteTool {
-        session_id: SessionId,
-        request_id: RequestId,
-        tool_name: String,
-        input: serde_json::Value,
-    },
-
     /// The kernel needs a permission decision from the user.
     /// The distro must respond with a PermissionResponse KernelRequest.
     PermissionRequired {
@@ -143,6 +112,17 @@ pub enum KernelEvent {
         session_id: SessionId,
         tool_name: String,
         input: serde_json::Value,
+    },
+
+    /// A tool finished executing. Carries the full JSON result the
+    /// model sees, so frontends can render a display summary.
+    /// Added in spec 0015 — the kernel now owns tool dispatch, so the
+    /// frontend needs a direct notification instead of running the
+    /// tool itself.
+    ToolCompleted {
+        session_id: SessionId,
+        tool_name: String,
+        result: serde_json::Value,
     },
 
     /// A turn started.
@@ -182,23 +162,11 @@ pub enum KernelEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ResourceBudget, SessionMode};
 
     #[test]
     fn kernel_request_round_trip() {
         let requests = vec![
-            KernelRequest::RegisterTools {
-                tools: vec![ToolSchema {
-                    name: "file_read".into(),
-                    description: "Read a file".into(),
-                    capabilities: CapabilitySet::new(),
-                    schema: serde_json::json!({"type": "object"}),
-                    cost: TokenEstimate(100),
-                    relevance: RelevanceSignal {
-                        keywords: vec!["read".into()],
-                        tags: vec!["fs".into()],
-                    },
-                }],
-            },
             KernelRequest::CreateSession {
                 config: SessionCreateConfig {
                     mode: SessionMode::Interactive,
@@ -217,11 +185,6 @@ mod tests {
             KernelRequest::AddInput {
                 session_id: SessionId(0),
                 text: "Hello".into(),
-            },
-            KernelRequest::ToolResult {
-                request_id: RequestId(1),
-                result: serde_json::json!("file contents"),
-                invalidations: vec![],
             },
             KernelRequest::PermissionResponse {
                 request_id: RequestId(2),
@@ -253,12 +216,6 @@ mod tests {
             KernelEvent::SessionCreated {
                 session_id: SessionId(0),
             },
-            KernelEvent::ExecuteTool {
-                session_id: SessionId(0),
-                request_id: RequestId(1),
-                tool_name: "file_read".into(),
-                input: serde_json::json!({"path": "src/main.rs"}),
-            },
             KernelEvent::PermissionRequired {
                 session_id: SessionId(0),
                 request_id: RequestId(2),
@@ -276,6 +233,11 @@ mod tests {
                 session_id: SessionId(0),
                 tool_name: "file_read".into(),
                 input: serde_json::json!({}),
+            },
+            KernelEvent::ToolCompleted {
+                session_id: SessionId(0),
+                tool_name: "file_read".into(),
+                result: serde_json::json!({"content": "fn main() {}"}),
             },
             KernelEvent::TurnStarted {
                 session_id: SessionId(0),
@@ -330,36 +292,5 @@ mod tests {
             let json2 = serde_json::to_string(&round_tripped).expect("re-serialize");
             assert_eq!(json, json2);
         }
-    }
-
-    #[test]
-    fn tool_schema_round_trip() {
-        let schema = ToolSchema {
-            name: "grep".into(),
-            description: "Search files".into(),
-            capabilities: {
-                let mut set = CapabilitySet::new();
-                set.insert(crate::types::Capability::new("fs:read"));
-                set
-            },
-            schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "path": {"type": "string"}
-                },
-                "required": ["pattern"]
-            }),
-            cost: TokenEstimate(150),
-            relevance: RelevanceSignal {
-                keywords: vec!["search".into(), "find".into(), "grep".into()],
-                tags: vec!["fs".into(), "search".into()],
-            },
-        };
-
-        let json = serde_json::to_string(&schema).expect("serialize");
-        let round_tripped: ToolSchema = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(schema.name, round_tripped.name);
-        assert_eq!(schema.cost, round_tripped.cost);
     }
 }

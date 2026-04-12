@@ -80,7 +80,7 @@ mod tests {
             },
             provider: ProviderConfig::Echo,
             policy: None,
-            tools: None,
+            toolsets: Vec::new(),
             frontend: None,
         }
     }
@@ -100,7 +100,7 @@ mod tests {
                 fallback,
             },
             policy: None,
-            tools: None,
+            toolsets: Vec::new(),
             frontend: None,
         }
     }

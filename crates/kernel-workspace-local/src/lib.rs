@@ -1,12 +1,88 @@
-//! Native Rust tool implementations for the code-agent distribution.
+//! Local filesystem workspace — the first-party `ToolSet` shipped with
+//! `agent-kernel`. Exposes six tools (`file_read`, `file_write`,
+//! `file_edit`, `shell`, `ls`, `grep`) scoped to a workspace root
+//! directory.
+//!
+//! Spec 0015 registers this crate in the daemon's factory table under
+//! `kind = "workspace.local"`. The factory (`from_entry`) parses the
+//! manifest entry's opaque `config` block for a `root` field (defaults
+//! to `"."`) and returns a boxed `ToolSet`. The toolset runs entirely
+//! in-process in 0015; spec 0016 will re-home it behind an MCP stdio
+//! transport without touching the kernel side of the trait.
 
-use kernel_interfaces::tool::{ToolError, ToolOutput, ToolRegistration};
+use kernel_interfaces::manifest::ToolsetEntry;
+use kernel_interfaces::tool::{ToolError, ToolExecutionCtx, ToolOutput, ToolRegistration};
+use kernel_interfaces::toolset::ToolSet;
 use kernel_interfaces::types::{
     Capability, CapabilitySet, Invalidation, RelevanceSignal, TokenEstimate,
 };
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+
+/// Names of every tool this toolset exposes, in registration order.
+/// Exported so distributions can build prompt text without reaching
+/// into the individual tool structs.
+pub const TOOL_NAMES: &[&str] = &[
+    "file_read",
+    "file_write",
+    "file_edit",
+    "shell",
+    "ls",
+    "grep",
+];
+
+/// A workspace rooted at a local directory. Implements `ToolSet` by
+/// returning the six filesystem/shell tools scoped to that directory.
+pub struct LocalWorkspace {
+    id: String,
+    root: PathBuf,
+}
+
+impl LocalWorkspace {
+    pub fn new(id: impl Into<String>, root: PathBuf) -> Self {
+        Self {
+            id: id.into(),
+            root,
+        }
+    }
+}
+
+impl ToolSet for LocalWorkspace {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn tools(&self) -> Vec<Box<dyn ToolRegistration>> {
+        let r = self.root.clone();
+        vec![
+            Box::new(FileReadTool::new(r.clone())),
+            Box::new(FileWriteTool::new(r.clone())),
+            Box::new(FileEditTool::new(r.clone())),
+            Box::new(ShellTool::new(r.clone())),
+            Box::new(LsTool::new(r.clone())),
+            Box::new(GrepTool::new(r)),
+        ]
+    }
+}
+
+/// Factory function registered under `kind = "workspace.local"`.
+///
+/// Reads `root` from `entry.config` (defaulting to the current directory
+/// if absent). The `id` field on the manifest entry, if present, becomes
+/// the toolset's identifier; otherwise we fall back to `"workspace.local"`.
+pub fn from_entry(entry: &ToolsetEntry) -> Result<Box<dyn ToolSet>, String> {
+    let root = entry
+        .config
+        .get("root")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+    let id = entry
+        .id
+        .clone()
+        .unwrap_or_else(|| "workspace.local".to_string());
+    Ok(Box::new(LocalWorkspace::new(id, PathBuf::from(root))))
+}
 
 // ============================================================================
 // file_read
@@ -71,7 +147,11 @@ impl ToolRegistration for FileReadTool {
         &self.relevance
     }
 
-    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        input: serde_json::Value,
+        _ctx: &ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let path_str = input
             .get("path")
             .and_then(|v| v.as_str())
@@ -161,7 +241,11 @@ impl ToolRegistration for FileWriteTool {
         &self.relevance
     }
 
-    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        input: serde_json::Value,
+        _ctx: &ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let path_str = input
             .get("path")
             .and_then(|v| v.as_str())
@@ -173,7 +257,6 @@ impl ToolRegistration for FileWriteTool {
 
         let full_path = self.workspace.join(path_str);
 
-        // Create parent directories if needed
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 ToolError::ExecutionFailed(format!("failed to create directories: {e}"))
@@ -248,7 +331,11 @@ impl ToolRegistration for ShellTool {
         &self.relevance
     }
 
-    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        input: serde_json::Value,
+        _ctx: &ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let command = input
             .get("command")
             .and_then(|v| v.as_str())
@@ -264,7 +351,6 @@ impl ToolRegistration for ShellTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Truncate large outputs
         let max_len = 50_000;
         let stdout_truncated = if stdout.len() > max_len {
             format!(
@@ -339,7 +425,11 @@ impl ToolRegistration for LsTool {
         &self.relevance
     }
 
-    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        input: serde_json::Value,
+        _ctx: &ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let path_str = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let full_path = self.workspace.join(path_str);
 
@@ -420,7 +510,11 @@ impl ToolRegistration for GrepTool {
         &self.relevance
     }
 
-    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        input: serde_json::Value,
+        _ctx: &ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let pattern = input
             .get("pattern")
             .and_then(|v| v.as_str())
@@ -436,7 +530,6 @@ impl ToolRegistration for GrepTool {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Limit results
         let lines: Vec<&str> = stdout.lines().take(100).collect();
         let total_matches = stdout.lines().count();
 
@@ -507,7 +600,11 @@ impl ToolRegistration for FileEditTool {
         &self.relevance
     }
 
-    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        input: serde_json::Value,
+        _ctx: &ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let path_str = input
             .get("path")
             .and_then(|v| v.as_str())
@@ -523,7 +620,6 @@ impl ToolRegistration for FileEditTool {
 
         let full_path = self.workspace.join(path_str);
 
-        // Creating a new file: old_string is empty, new_string is the content
         if old_string.is_empty() {
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -546,7 +642,6 @@ impl ToolRegistration for FileEditTool {
             ToolError::ExecutionFailed(format!("failed to read {}: {e}", full_path.display()))
         })?;
 
-        // Check uniqueness
         let match_count = content.matches(old_string).count();
         if match_count == 0 {
             return Err(ToolError::ExecutionFailed(
@@ -574,108 +669,132 @@ impl ToolRegistration for FileEditTool {
     }
 }
 
-// ============================================================================
-// Factory
-// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
 
-/// Extract a ToolSchema from a ToolRegistration (serializable metadata for the kernel protocol).
-pub fn to_schema(tool: &dyn ToolRegistration) -> kernel_interfaces::protocol::ToolSchema {
-    kernel_interfaces::protocol::ToolSchema {
-        name: tool.name().to_string(),
-        description: tool.description().to_string(),
-        capabilities: tool.capabilities().clone(),
-        schema: tool.schema().clone(),
-        cost: tool.cost(),
-        relevance: tool.relevance().clone(),
+    fn ctx() -> ToolExecutionCtx<'static> {
+        ToolExecutionCtx::null()
     }
-}
 
-/// All tool IDs the `dist-code-agent` distribution implements.
-/// Used as the default enable list when the distribution manifest
-/// has no `[tools]` section.
-pub const TOOL_IDS: &[&str] = &[
-    "file_read",
-    "file_write",
-    "file_edit",
-    "shell",
-    "ls",
-    "grep",
-];
+    fn ws() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    }
 
-/// Create distribution tools for the given workspace, filtered to the
-/// set of IDs the caller names.
-///
-/// - `enabled = None` → every tool in `TOOL_IDS` (backwards-compat default).
-/// - `enabled = Some(&[])` → no tools at all. Explicit.
-/// - `enabled = Some(&["file_read", "grep"])` → only those two.
-///
-/// Unknown IDs log a stderr warning and are otherwise ignored.
-pub fn create_tools(
-    workspace: &Path,
-    enabled: Option<&[String]>,
-) -> Vec<Box<dyn ToolRegistration>> {
-    let ws = workspace.to_path_buf();
-
-    let build_all: Vec<Box<dyn ToolRegistration>> = vec![
-        Box::new(FileReadTool::new(ws.clone())),
-        Box::new(FileWriteTool::new(ws.clone())),
-        Box::new(FileEditTool::new(ws.clone())),
-        Box::new(ShellTool::new(ws.clone())),
-        Box::new(LsTool::new(ws.clone())),
-        Box::new(GrepTool::new(ws)),
-    ];
-
-    match enabled {
-        None => build_all,
-        Some(ids) => {
-            // Warn on unknown IDs so typos in the manifest are visible.
-            for id in ids {
-                if !TOOL_IDS.contains(&id.as_str()) {
-                    eprintln!(
-                        "warning: manifest lists unknown tool id {id:?}; known IDs are {TOOL_IDS:?}"
-                    );
-                }
-            }
-            build_all
-                .into_iter()
-                .filter(|tool| ids.iter().any(|id| id == tool.name()))
-                .collect()
+    #[test]
+    fn from_entry_defaults_root_to_dot() {
+        let entry = ToolsetEntry {
+            kind: "workspace.local".into(),
+            id: None,
+            config: toml::Value::Table(Default::default()),
+        };
+        let toolset = from_entry(&entry).expect("factory");
+        assert_eq!(toolset.id(), "workspace.local");
+        let tools = toolset.tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        for expected in TOOL_NAMES {
+            assert!(names.contains(expected), "missing tool: {expected}");
         }
     }
-}
-
-#[cfg(test)]
-mod filter_tests {
-    use super::*;
-    use std::path::PathBuf;
 
     #[test]
-    fn none_enables_every_tool() {
-        let tools = create_tools(&PathBuf::from("/tmp"), None);
-        assert_eq!(tools.len(), TOOL_IDS.len());
+    fn from_entry_uses_id_when_provided() {
+        let entry = ToolsetEntry {
+            kind: "workspace.local".into(),
+            id: Some("ws1".into()),
+            config: toml::Value::Table(Default::default()),
+        };
+        let toolset = from_entry(&entry).expect("factory");
+        assert_eq!(toolset.id(), "ws1");
     }
 
     #[test]
-    fn empty_list_disables_everything() {
-        let tools = create_tools(&PathBuf::from("/tmp"), Some(&[]));
-        assert!(tools.is_empty());
+    fn file_read_and_write_round_trip() {
+        let (_dir, root) = ws();
+        let write = FileWriteTool::new(root.clone());
+        write
+            .execute(
+                serde_json::json!({ "path": "hello.txt", "content": "hi\nworld" }),
+                &ctx(),
+            )
+            .expect("write");
+
+        let read = FileReadTool::new(root.clone());
+        let out = read
+            .execute(serde_json::json!({ "path": "hello.txt" }), &ctx())
+            .expect("read");
+        let content = out.result.get("content").unwrap().as_str().unwrap();
+        assert!(content.contains("hi"));
+        assert!(content.contains("world"));
     }
 
     #[test]
-    fn filter_narrows_to_named_tools() {
-        let enabled: Vec<String> = vec!["file_read".into(), "grep".into()];
-        let tools = create_tools(&PathBuf::from("/tmp"), Some(&enabled));
-        assert_eq!(tools.len(), 2);
+    fn file_edit_replaces_unique_string() {
+        let (_dir, root) = ws();
+        FileWriteTool::new(root.clone())
+            .execute(
+                serde_json::json!({ "path": "a.txt", "content": "foo bar baz" }),
+                &ctx(),
+            )
+            .expect("write");
+
+        FileEditTool::new(root.clone())
+            .execute(
+                serde_json::json!({
+                    "path": "a.txt",
+                    "old_string": "bar",
+                    "new_string": "BAR",
+                }),
+                &ctx(),
+            )
+            .expect("edit");
+
+        let out = FileReadTool::new(root)
+            .execute(serde_json::json!({ "path": "a.txt" }), &ctx())
+            .expect("read");
+        assert!(
+            out.result
+                .get("content")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("foo BAR baz")
+        );
+    }
+
+    #[test]
+    fn shell_executes_command_in_workspace() {
+        let (_dir, root) = ws();
+        let out = ShellTool::new(root)
+            .execute(serde_json::json!({ "command": "echo hello" }), &ctx())
+            .expect("shell");
+        let stdout = out.result.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("hello"));
+    }
+
+    #[test]
+    fn ls_lists_entries() {
+        let (_dir, root) = ws();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let out = LsTool::new(root)
+            .execute(serde_json::json!({}), &ctx())
+            .expect("ls");
+        let entries = out.result.get("entries").unwrap().as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn local_workspace_exposes_all_tool_names() {
+        let (_dir, root) = ws();
+        let workspace = LocalWorkspace::new("test", root);
+        let tools = workspace.tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"file_read"));
-        assert!(names.contains(&"grep"));
-    }
-
-    #[test]
-    fn unknown_id_is_warned_and_dropped() {
-        let enabled: Vec<String> = vec!["file_read".into(), "doesnt_exist".into()];
-        let tools = create_tools(&PathBuf::from("/tmp"), Some(&enabled));
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), "file_read");
+        for expected in TOOL_NAMES {
+            assert!(names.contains(expected), "missing: {expected}");
+        }
     }
 }

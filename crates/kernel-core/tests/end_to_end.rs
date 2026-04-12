@@ -669,7 +669,11 @@ fn e2e_tool_execution_error() {
                 tags: Vec::new(),
             }))
         }
-        fn execute(&self, _: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        fn execute(
+            &self,
+            _: serde_json::Value,
+            _: &kernel_interfaces::tool::ToolExecutionCtx<'_>,
+        ) -> Result<ToolOutput, ToolError> {
             Err(ToolError::ExecutionFailed("disk on fire".into()))
         }
     }

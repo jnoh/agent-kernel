@@ -128,7 +128,11 @@ impl ToolRegistration for FakeTool {
     fn relevance(&self) -> &RelevanceSignal {
         &self.relevance
     }
-    fn execute(&self, _input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &kernel_interfaces::tool::ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         self.called.store(true, Ordering::Relaxed);
         Ok(ToolOutput::readonly(self.return_value.clone()))
     }
@@ -189,7 +193,11 @@ impl ToolRegistration for RecordingTool {
     fn relevance(&self) -> &RelevanceSignal {
         &self.relevance
     }
-    fn execute(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        input: serde_json::Value,
+        _ctx: &kernel_interfaces::tool::ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         self.invocations.lock().unwrap().push(input);
         let mut outputs = self.outputs.lock().unwrap();
         if outputs.is_empty() {
@@ -210,6 +218,7 @@ pub struct RecordingFrontend {
     pub turns_ended: AtomicU64,
     pub tool_calls: Mutex<Vec<String>>,
     pub tool_results: Mutex<Vec<serde_json::Value>>,
+    pub tool_chunks: Mutex<Vec<(String, kernel_interfaces::tool::ToolChunkStream, String)>>,
     pub permission_requests: Mutex<Vec<String>>,
     pub compactions: AtomicU64,
     pub errors: Mutex<Vec<String>>,
@@ -223,6 +232,7 @@ impl RecordingFrontend {
             turns_ended: AtomicU64::new(0),
             tool_calls: Mutex::new(Vec::new()),
             tool_results: Mutex::new(Vec::new()),
+            tool_chunks: Mutex::new(Vec::new()),
             permission_requests: Mutex::new(Vec::new()),
             compactions: AtomicU64::new(0),
             errors: Mutex::new(Vec::new()),
@@ -252,6 +262,17 @@ impl FrontendEvents for RecordingFrontend {
             .lock()
             .unwrap()
             .push(result.result.clone());
+    }
+    fn on_tool_output_chunk(
+        &self,
+        tool_name: &str,
+        stream: kernel_interfaces::tool::ToolChunkStream,
+        data: &str,
+    ) {
+        self.tool_chunks
+            .lock()
+            .unwrap()
+            .push((tool_name.into(), stream, data.into()));
     }
     fn on_permission_request(&self, request: &PermissionRequest) -> Decision {
         self.permission_requests

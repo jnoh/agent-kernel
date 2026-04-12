@@ -55,6 +55,10 @@ enum DispatchOutcome {
 
 /// Execute a tool and record the result in context. Returns Executed on success or error
 /// (both count as dispatched — the model sees the result either way).
+///
+/// Builds a `ToolExecutionCtx` whose chunk sink forwards to
+/// `frontend.on_tool_output_chunk`. Spec 0015 wires the plumbing; tools
+/// in-tree don't emit chunks yet, but MCP-backed tools in 0016 will.
 fn execute_tool(
     tool: &dyn ToolRegistration,
     tool_name: &str,
@@ -62,7 +66,12 @@ fn execute_tool(
     context: &mut ContextManager,
     frontend: &dyn FrontendEvents,
 ) -> DispatchOutcome {
-    match tool.execute(input.clone()) {
+    let chunk_sink = |chunk: kernel_interfaces::tool::ToolChunk| {
+        frontend.on_tool_output_chunk(tool_name, chunk.stream, &chunk.data);
+    };
+    let ctx = kernel_interfaces::tool::ToolExecutionCtx::with_sink(&chunk_sink);
+
+    match tool.execute(input.clone(), &ctx) {
         Ok(output) => {
             for inv in &output.invalidations {
                 context.process_invalidation(inv);
@@ -548,5 +557,91 @@ mod tests {
 
         assert_eq!(r1.turn_id, TurnId(0));
         assert_eq!(r2.turn_id, TurnId(1));
+    }
+
+    /// A tool that emits two chunks during execute before returning
+    /// its final result. Used to verify that the turn loop threads a
+    /// chunk sink through `ToolExecutionCtx` into `FrontendEvents`.
+    struct StreamingTool {
+        caps: kernel_interfaces::types::CapabilitySet,
+        relevance: kernel_interfaces::types::RelevanceSignal,
+    }
+
+    impl StreamingTool {
+        fn new() -> Self {
+            use kernel_interfaces::types::Capability;
+            Self {
+                caps: [Capability::new("fs:read")].into_iter().collect(),
+                relevance: kernel_interfaces::types::RelevanceSignal {
+                    keywords: Vec::new(),
+                    tags: Vec::new(),
+                },
+            }
+        }
+    }
+
+    impl ToolRegistration for StreamingTool {
+        fn name(&self) -> &str {
+            "streaming_tool"
+        }
+        fn description(&self) -> &str {
+            "emits two chunks then finishes"
+        }
+        fn capabilities(&self) -> &kernel_interfaces::types::CapabilitySet {
+            &self.caps
+        }
+        fn schema(&self) -> &serde_json::Value {
+            &serde_json::Value::Null
+        }
+        fn cost(&self) -> kernel_interfaces::types::TokenEstimate {
+            kernel_interfaces::types::TokenEstimate(0)
+        }
+        fn relevance(&self) -> &kernel_interfaces::types::RelevanceSignal {
+            &self.relevance
+        }
+        fn execute(
+            &self,
+            _input: serde_json::Value,
+            ctx: &kernel_interfaces::tool::ToolExecutionCtx<'_>,
+        ) -> Result<kernel_interfaces::tool::ToolOutput, kernel_interfaces::tool::ToolError>
+        {
+            use kernel_interfaces::tool::{ToolChunk, ToolChunkStream, ToolOutput};
+            ctx.emit_chunk(ToolChunk {
+                stream: ToolChunkStream::Stdout,
+                data: "partial one".into(),
+            });
+            ctx.emit_chunk(ToolChunk {
+                stream: ToolChunkStream::Stderr,
+                data: "partial two".into(),
+            });
+            Ok(ToolOutput::readonly(serde_json::json!("done")))
+        }
+    }
+
+    #[test]
+    fn streaming_tool_chunks_reach_frontend_in_order() {
+        use kernel_interfaces::tool::ToolChunkStream;
+        let (mut cm, pe) = context_and_permission();
+        cm.append_user_input("Run it".into());
+
+        let provider = FakeProvider {
+            response: tool_call_response("streaming_tool", serde_json::json!({})),
+        };
+        let frontend = RecordingFrontend::auto_allow();
+        let tool: Box<dyn ToolRegistration> = Box::new(StreamingTool::new());
+        let tools = vec![tool];
+        let mut turn_loop = TurnLoop::new(CompletionConfig::default(), 20);
+
+        turn_loop
+            .run_turn(&provider, &mut cm, &pe, &tools, &frontend, &no_cancel())
+            .expect("turn");
+
+        let chunks = frontend.tool_chunks.lock().unwrap();
+        assert_eq!(chunks.len(), 2, "expected two chunks, got {:?}", chunks);
+        assert_eq!(chunks[0].0, "streaming_tool");
+        assert!(matches!(chunks[0].1, ToolChunkStream::Stdout));
+        assert_eq!(chunks[0].2, "partial one");
+        assert!(matches!(chunks[1].1, ToolChunkStream::Stderr));
+        assert_eq!(chunks[1].2, "partial two");
     }
 }

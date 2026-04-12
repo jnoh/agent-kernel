@@ -222,6 +222,7 @@ dependencies = [
  "crossterm",
  "kernel-core",
  "kernel-interfaces",
+ "kernel-workspace-local",
  "pulldown-cmark",
  "ratatui",
  "serde",
@@ -555,6 +556,7 @@ dependencies = [
  "kernel-core",
  "kernel-interfaces",
  "kernel-providers",
+ "kernel-workspace-local",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -580,6 +582,17 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "kernel-workspace-local"
+version = "0.1.0"
+dependencies = [
+ "kernel-interfaces",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

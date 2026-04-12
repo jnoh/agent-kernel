@@ -3,8 +3,10 @@
 
 mod manifest;
 mod router;
+mod toolset_pool;
 
 use kernel_interfaces::framing::{read_message, write_message};
+use kernel_interfaces::manifest::ToolsetEntry;
 use kernel_interfaces::protocol::{KernelEvent, KernelRequest};
 use kernel_interfaces::provider::ProviderInterface;
 use kernel_providers::{AnthropicProvider, EchoProvider};
@@ -13,6 +15,8 @@ use router::ConnectionRouter;
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::sync::Arc;
+use toolset_pool::{ToolsetPool, default_registry};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -30,54 +34,64 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
 
-    // Build the provider factory. Two paths:
-    //  1. If --distro is set, load the manifest and derive the factory from it (preferred).
+    // Build the provider factory and toolset pool. Two paths:
+    //  1. If --distro is set, load the manifest and derive both from it (preferred).
     //  2. Otherwise fall back to the old --model + ANTHROPIC_API_KEY env var shape
-    //     (deprecated; kept so an old checkout without distros/code-agent.toml still runs).
-    let provider_factory: ProviderFactory = match distro_path {
-        Some(ref path) => {
-            let manifest = load_manifest(path).unwrap_or_else(|e| {
-                eprintln!("failed to load manifest: {e}");
-                std::process::exit(1);
-            });
-            eprintln!(
-                "distribution: {} v{}",
-                manifest.distribution.name, manifest.distribution.version
-            );
-            build_provider_factory(&manifest).unwrap_or_else(|e| {
-                eprintln!("failed to build provider from manifest: {e}");
-                std::process::exit(1);
-            })
-        }
-        None => {
-            eprintln!(
-                "warning: --distro not set; falling back to --model + ANTHROPIC_API_KEY \
-                 env var (deprecated, will be removed)"
-            );
-            let model = args
-                .iter()
-                .position(|a| a == "--model")
-                .and_then(|i| args.get(i + 1))
-                .cloned()
-                .unwrap_or_else(|| "claude-sonnet-4-5".into());
-            let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
-            match api_key {
-                Some(key) => {
-                    eprintln!("using model: {model}");
-                    std::sync::Arc::new(move || {
-                        Box::new(AnthropicProvider::new(key.clone(), model.clone()))
-                            as Box<dyn ProviderInterface + Send>
-                    })
-                }
-                None => {
-                    eprintln!("no ANTHROPIC_API_KEY — using echo provider");
-                    std::sync::Arc::new(|| {
-                        Box::new(EchoProvider) as Box<dyn ProviderInterface + Send>
-                    })
-                }
+    //     with an empty toolset pool (deprecated; kept so an old checkout without
+    //     distros/code-agent.toml still runs).
+    let (provider_factory, toolset_entries): (ProviderFactory, Vec<ToolsetEntry>) =
+        match distro_path {
+            Some(ref path) => {
+                let manifest = load_manifest(path).unwrap_or_else(|e| {
+                    eprintln!("failed to load manifest: {e}");
+                    std::process::exit(1);
+                });
+                eprintln!(
+                    "distribution: {} v{}",
+                    manifest.distribution.name, manifest.distribution.version
+                );
+                let factory = build_provider_factory(&manifest).unwrap_or_else(|e| {
+                    eprintln!("failed to build provider from manifest: {e}");
+                    std::process::exit(1);
+                });
+                (factory, manifest.toolsets.clone())
             }
-        }
-    };
+            None => {
+                eprintln!(
+                    "warning: --distro not set; falling back to --model + ANTHROPIC_API_KEY \
+                     env var and an empty toolset pool (deprecated, will be removed)"
+                );
+                let model = args
+                    .iter()
+                    .position(|a| a == "--model")
+                    .and_then(|i| args.get(i + 1))
+                    .cloned()
+                    .unwrap_or_else(|| "claude-sonnet-4-5".into());
+                let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+                let factory: ProviderFactory = match api_key {
+                    Some(key) => {
+                        eprintln!("using model: {model}");
+                        Arc::new(move || {
+                            Box::new(AnthropicProvider::new(key.clone(), model.clone()))
+                                as Box<dyn ProviderInterface + Send>
+                        })
+                    }
+                    None => {
+                        eprintln!("no ANTHROPIC_API_KEY — using echo provider");
+                        Arc::new(|| Box::new(EchoProvider) as Box<dyn ProviderInterface + Send>)
+                    }
+                };
+                (factory, Vec::new())
+            }
+        };
+
+    let registry = default_registry();
+    let toolset_pool = ToolsetPool::build(&toolset_entries, &registry).unwrap_or_else(|e| {
+        eprintln!("failed to build toolset pool: {e}");
+        std::process::exit(1);
+    });
+    eprintln!("toolset pool ready ({} entries)", toolset_entries.len());
+    let toolset_pool = Arc::new(toolset_pool);
 
     // Clean up stale socket
     if socket_path.exists() {
@@ -123,7 +137,8 @@ fn main() {
         });
 
         // Router handles all protocol logic
-        let mut router = ConnectionRouter::new(event_tx, provider_factory.clone());
+        let mut router =
+            ConnectionRouter::new(event_tx, provider_factory.clone(), toolset_pool.clone());
 
         // Reader loop: reads KernelRequests from the distro
         let mut reader = BufReader::new(reader_stream);

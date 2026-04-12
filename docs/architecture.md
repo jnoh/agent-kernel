@@ -312,7 +312,7 @@ struct Session {
     turn_loop: TurnLoop,                  // its own turn loop instance
     context_manager: ContextManager,      // its own context window
     permission_evaluator: PermissionEvaluator, // its own policy
-    tools: Vec<Box<dyn ToolRegistration>>,
+    tools: Vec<Arc<dyn ToolRegistration>>, // Arc because the daemon-wide ToolsetPool shares tools across sessions
     frontend: Box<dyn FrontendEvents>,
     mode: SessionMode,                    // interactive or autonomous
     resource_budget: ResourceBudget,      // carved from global budget
@@ -459,8 +459,14 @@ struct ToolRegistration {
     /// The context manager uses this for demand-paging decisions.
     relevance: RelevanceSignal,
     
-    /// The actual work.
-    fn execute(input: ToolInput) -> Result<ToolOutput, ToolError>;
+    /// The actual work. `ctx` carries a per-invocation chunk sink the tool can use
+    /// to stream incremental output (stdout/stderr/text) to the frontend; non-streaming
+    /// tools ignore it. The turn loop builds a fresh `ToolExecutionCtx` per call whose
+    /// sink forwards to `FrontendEvents::on_tool_output_chunk`.
+    fn execute(
+        input: ToolInput,
+        ctx: &ToolExecutionCtx<'_>,
+    ) -> Result<ToolOutput, ToolError>;
 }
 
 /// What a tool returns after execution.
@@ -546,32 +552,54 @@ All tools — regardless of implementation language or execution model — regis
 
 **Path 3: MCP bridge (protocol translation).** MCP servers register through a bridge module that translates MCP tool definitions into `ToolRegistration` format. The bridge infers capability declarations from MCP's `readOnlyHint`/`destructiveHint` annotations, estimates cost from schema size, and generates relevance signals from tool names and descriptions. Each MCP server's tools appear as individual `ToolRegistration` entries.
 
-All three paths produce `Box<dyn ToolRegistration>`. The kernel, context manager, and permission evaluator treat them identically. The only difference is execution latency.
+All three paths produce `Arc<dyn ToolRegistration>` and are grouped into a `ToolSet` (§4.2.1). The kernel, context manager, and permission evaluator treat them identically. The only difference is execution latency.
 
-```
-fn load_tools(config: &Config) -> Vec<Box<dyn ToolRegistration>> {
-    let mut tools = Vec::new();
-    
-    // Path 1: Native Rust tools (compiled in via Cargo features)
-    #[cfg(feature = "tool-filesystem")]
-    tools.extend(tool_filesystem::register());
-    
-    // Path 2: External tools from tool.toml manifests
-    for manifest in discover_tool_manifests(&config.tools.external_dirs) {
-        tools.push(Box::new(ExternalTool::from_manifest(manifest)));
-    }
-    
-    // Path 3: MCP servers
-    for (name, mcp_config) in &config.tools.mcp {
-        let bridge = McpBridge::connect(name, mcp_config)?;
-        for mcp_tool in bridge.list_tools()? {
-            tools.push(Box::new(McpToolAdapter::from(mcp_tool)));
-        }
-    }
-    
-    tools  // all three paths produce the same type
+#### 4.2.1 ToolSet and the daemon toolset pool
+
+A **`ToolSet`** is a named group of tools that share a lifetime and origin — a single
+local workspace, a single MCP server, a single HTTP tool server. The trait lives in
+`kernel-interfaces::toolset`:
+
+```rust
+pub trait ToolSet: Send + Sync {
+    fn id(&self) -> &str;
+    fn tools(&self) -> Vec<Box<dyn ToolRegistration>>;
 }
 ```
+
+The daemon (`kernel-daemon::toolset_pool`) owns a **`ToolsetPool`** at process lifetime,
+built at startup from `[[toolset]]` entries in the distribution manifest. Each entry has
+a `kind` string (e.g. `"workspace.local"`), an optional `id`, and an opaque
+`[toolset.config]` block. A `FactoryRegistry` maps `kind` → factory function, returning
+`Box<dyn ToolSet>`. `ToolsetPool::build` calls each factory, collects every set's tools
+into a merged `Vec<Arc<dyn ToolRegistration>>`, and fails hard on name collisions across
+sets. At session create, `ConnectionRouter` calls `pool.tools_for_session()` to snapshot
+the shared tool list into the new session — the old `RegisterTools` / `ExecuteTool` /
+`ToolResult` round-trip between daemon and distribution is gone, along with the
+`proxy_tool.rs` and `in_process.rs` modules that implemented it. Dispatch is now
+entirely kernel-owned: the turn loop calls `tool.execute(...)` directly on an `Arc`-held
+tool and, when a tool finishes, emits a `KernelEvent::ToolCompleted` so the frontend
+sees the result without any distro-side execution hop.
+
+The one built-in factory registered in `default_registry()` is
+`"workspace.local" → kernel_workspace_local::from_entry`. `kernel-workspace-local` is a
+library crate that hosts the six filesystem tools (`file_read`, `file_write`,
+`file_edit`, `grep`, `glob`, `ls`) moved out of `dist-code-agent`; it depends only on
+`kernel-interfaces`. Spec 0016 will add a second factory, `"mcp.stdio"`, that swaps the
+in-process `LocalWorkspace` transport for a subprocess without touching any trait
+signature — the factory seam is the whole point of doing 0015 before 0016.
+
+#### Streaming tool output
+
+`ToolRegistration::execute` takes a `ctx: &ToolExecutionCtx<'_>` parameter. The ctx is a
+concrete struct holding an optional chunk sink (`Option<&dyn Fn(ToolChunk)>`). Tools that
+want to stream call `ctx.emit_chunk(ToolChunk { stream, data })` where `stream` is
+`ToolChunkStream::{Stdout, Stderr, Text}`; non-streaming tools ignore the argument. The
+turn loop builds a fresh ctx per tool call whose sink forwards to
+`FrontendEvents::on_tool_output_chunk(tool_name, stream, data)` (empty default impl, so
+existing frontends need no changes). No wire-level chunk event is plumbed across the
+socket yet — chunk streaming terminates at the daemon's `FrontendEvents` impl in 0015;
+spec 0016 widens it to the protocol when subprocesses need it.
 
 #### Tool SDK
 
@@ -624,6 +652,11 @@ trait FrontendEvents: Send {
     
     /// A tool produced a result
     fn on_tool_result(&self, tool_name: &str, result: &ToolOutput);
+
+    /// Streaming chunk emitted by a tool during execution (stdout, stderr, or text).
+    /// Empty default impl — frontends only override when they want live tool output.
+    fn on_tool_output_chunk(&self, tool_name: &str, stream: ToolChunkStream, data: &str) {}
+
     
     /// Permission required — returns user's decision
     fn on_permission_request(&self, request: &PermissionRequest) -> Decision;
@@ -900,7 +933,7 @@ A different distribution — `dist-support-agent` — would ship a completely di
 
 ### Three-path tool implementation
 
-All tools — kernel-internal, distribution, or third-party — produce the same `Box<dyn ToolRegistration>`. The kernel doesn't know or care which path produced each tool.
+All tools — kernel-internal, distribution, or third-party — produce the same `Arc<dyn ToolRegistration>`, grouped under a `ToolSet` (§4.2.1). The kernel doesn't know or care which path produced each tool.
 
 **Path 1: Native Rust crate (in-process, fast path).** Used for performance-critical tools called hundreds of times per session (file_read, grep). Compiled into the distribution binary via Cargo features. Zero IPC overhead — direct function calls.
 
@@ -971,18 +1004,21 @@ fallback = "echo"              # downgrade to EchoProvider if the env var is mis
 [policy]
 file = "../policies/permissive.yaml"   # path resolved relative to the manifest
 
-[tools]
-enabled = ["file_read", "file_write", "file_edit", "shell", "ls", "grep"]
+[[toolset]]
+kind = "workspace.local"
+id = "workspace"
+[toolset.config]
+root = "."
 
 [frontend]
 type = "tui"                  # "tui" or "repl"
 ```
 
-The `DistributionManifest` type and its section structs (`ProviderConfig`, `PolicyConfig`, `ToolsConfig`, `FrontendConfig`) live in `kernel-interfaces::manifest` so both the daemon and distribution binaries parse the same shape. `dist-code-agent` bundles the parsed result into a `DistributionSettings` struct (policy, enabled-tool ID set, frontend kind) which `tools::create_tools` filters against a compile-time `TOOL_IDS` constant to produce the session's tool set.
+The `DistributionManifest` type and its section structs (`ProviderConfig`, `PolicyConfig`, `ToolsetEntry`, `FrontendConfig`) live in `kernel-interfaces::manifest` so both the daemon and distribution binaries parse the same shape. The `[[toolset]]` array is consumed by the daemon: at startup, `ToolsetPool::build` dispatches each entry's `kind` against `default_registry()` and hands the resulting `Box<dyn ToolSet>` values to the pool. Distributions no longer ship tools themselves — `dist-code-agent` consumes only `[provider]`, `[policy]`, and `[frontend]`, and receives its tool list at session create from the daemon's pool. A legacy `[tools] enabled = [...]` section now fails to parse.
 
 **What works today vs the full vision:**
-- Provider, policy file, tool selection, and frontend kind are all manifest-driven.
-- Tools are still compiled into `dist-code-agent` — `[tools] enabled` is a filter over the built-in set, not a loader. External tools, MCP servers, and custom distro-author tools (`[tools.external]`, `[tools.mcp]`, `[tools.custom]` in the older sketch) do not exist yet.
+- Provider, policy file, toolset entries, and frontend kind are all manifest-driven.
+- The one factory registered in `default_registry()` is `"workspace.local"`, backed by the `kernel-workspace-local` library crate (six filesystem tools). Spec 0016 adds an `"mcp.stdio"` factory for subprocess-hosted toolsets without changing any kernel trait signatures.
 - Frontends are still compile-time: `FrontendKind::Tui` and `FrontendKind::Repl` both live inside `dist-code-agent`. A `frontend-tui` / `frontend-repl` split and headless variants are future work.
 - `[skills]` is not parsed.
 - There is no `agent-kernel install` subcommand; deployment is "run the daemon with `--distro`, run the distro binary with `--distro`." CLI-level overrides (`--policy`, `--frontend`, `--tool-catalog`) are not implemented — the `--repl` flag on `dist-code-agent` still works but prints a deprecation warning pointing at `[frontend] type = "repl"`.
@@ -1023,7 +1059,7 @@ There is no separate `agent-kernel.toml` — the distribution manifest (§7) is 
 | `[distribution]` | both | Name + version string, printed at startup for operator visibility. |
 | `[provider]` | `kernel-daemon` | Selects `AnthropicProvider` / `EchoProvider`, reads the API key from `api_key_env`, optionally falls back to `echo` when the env var is missing. |
 | `[policy]` | `dist-code-agent` | `file = "..."` points at a YAML policy file; the path is resolved relative to the manifest's directory. |
-| `[tools]` | `dist-code-agent` | `enabled = [...]` filters the compiled-in tool set by ID. Omitting the section keeps all tools. |
+| `[[toolset]]` | `kernel-daemon` | Each entry has a `kind` (dispatched against `default_registry()`), an optional `id`, and an opaque `[toolset.config]` block. `ToolsetPool::build` constructs each set at startup; the merged tool list is snapshotted into every new session. |
 | `[frontend]` | `dist-code-agent` | `type = "tui"` or `type = "repl"`. Overrides the deprecated `--repl` CLI flag. |
 
 Kernel-level tuning (context window, compaction threshold, token budgets) and channel/skill config are not yet exposed in the manifest — those values live in Rust today and will grow new sections as the relevant subsystems mature. See `distros/code-agent.toml` for the current concrete example.
@@ -1088,8 +1124,9 @@ agent-kernel/
 │   ├── kernel-interfaces/    # ProviderInterface, ToolRegistration, manifest types, etc. (stable API surface)
 │   ├── kernel-core/          # Turn loop, context manager, permission evaluator, session manager
 │   ├── kernel-providers/     # First-party ProviderInterface impls (AnthropicProvider, EchoProvider)
-│   ├── kernel-daemon/        # Unix-socket daemon hosting the kernel; router wires providers per session
-│   └── dist-code-agent/      # Reference coding agent distribution (TUI frontend, filesystem tools)
+│   ├── kernel-workspace-local/ # Built-in ToolSet: six filesystem tools over a local root
+│   ├── kernel-daemon/        # Unix-socket daemon hosting the kernel; owns the ToolsetPool and wires providers per session
+│   └── dist-code-agent/      # Reference coding agent distribution (TUI frontend; no tools)
 ├── policies/
 │   ├── permissive.yaml
 │   └── lockdown.yaml

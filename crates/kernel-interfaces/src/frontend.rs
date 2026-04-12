@@ -1,5 +1,5 @@
 use crate::provider::ProviderInterface;
-use crate::tool::ToolOutput;
+use crate::tool::{ToolChunkStream, ToolOutput};
 use crate::types::{Decision, StreamChunk, TurnId};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -44,6 +44,12 @@ pub trait FrontendEvents: Send {
 
     /// A tool produced a result.
     fn on_tool_result(&self, tool_name: &str, result: &ToolOutput);
+
+    /// Incremental output chunk from a still-running tool. Default impl
+    /// drops the chunk — only frontends that want live streaming need to
+    /// override. Spec 0015 wires the plumbing; spec 0016 starts emitting
+    /// real chunks from the shell tool.
+    fn on_tool_output_chunk(&self, _tool_name: &str, _stream: ToolChunkStream, _data: &str) {}
 
     /// Permission required — returns user's decision.
     fn on_permission_request(&self, request: &PermissionRequest) -> Decision;

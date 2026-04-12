@@ -122,7 +122,11 @@ mod tests {
         fn relevance(&self) -> &RelevanceSignal {
             &self.relevance
         }
-        fn execute(&self, _input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &kernel_interfaces::tool::ToolExecutionCtx<'_>,
+        ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::readonly(serde_json::Value::Null))
         }
     }

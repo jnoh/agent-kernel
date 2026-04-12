@@ -3,6 +3,7 @@ members = [
     "crates/kernel-interfaces",
     "crates/kernel-core",
     "crates/kernel-providers",
+    "crates/kernel-workspace-local",
     "crates/kernel-daemon",
     "crates/dist-code-agent",
 ]
