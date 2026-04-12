@@ -68,9 +68,13 @@ impl FrontendEvents for ProxyFrontend {
         });
     }
 
-    fn on_stream_chunk(&self, _chunk: &StreamChunk) {
-        // Streaming not yet supported over IPC — will be added when
-        // the provider supports streaming.
+    fn on_stream_chunk(&self, chunk: &StreamChunk) {
+        if let StreamChunk::Text(text) = chunk {
+            self.send(KernelEvent::ModelStreamChunk {
+                session_id: self.session_id,
+                text: text.clone(),
+            });
+        }
     }
 
     fn on_text(&self, text: &str) {

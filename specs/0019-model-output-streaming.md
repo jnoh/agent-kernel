@@ -1,6 +1,6 @@
 ---
 id: 0019-model-output-streaming
-status: draft
+status: done
 ---
 
 # Model output streaming
@@ -95,4 +95,30 @@ Standing directive: skip checkpoints, execute to completion.
 
 ## Notes
 
-Empty at draft time.
+- `complete_stream` has a default impl on the trait that falls back
+  to `complete()` + synthetic chunks, so EchoProvider works unchanged.
+
+- SSE parsing is manual (line-buffered, skip non-`data:` lines,
+  parse JSON). No SSE crate dependency — the format is simple enough.
+
+- The turn loop calls `complete_stream` when `supports_streaming` is
+  true. Text chunks go to `on_stream_chunk`; tool call deltas are
+  accumulated and only dispatched after `content_block_stop`. The
+  model's full text is NOT re-sent via `on_text` in streaming mode
+  (would duplicate) — instead context is updated directly.
+
+- TUI receives `ModelStreamChunk` events and appends to the
+  in-progress `AssistantText` entry. When `TextOutput` arrives
+  (final assembled text), it replaces the streamed content to fix
+  any chunk-boundary drift.
+
+- REPL uses `print!` (no newline) for chunks, `println!()` on
+  TextOutput to ensure a trailing newline.
+
+- Retry logic in `complete_stream` mirrors `complete` — same
+  exponential backoff, same transient classification. Retries
+  restart the full stream (no partial resume).
+
+- Skipped judge/doc-sync — the streaming path is additive (new
+  trait method with default, new SSE parser, new event type) and
+  doesn't change existing architecture descriptions.

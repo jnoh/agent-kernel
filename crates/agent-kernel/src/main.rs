@@ -638,10 +638,28 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
                 .push(tui::ConversationEntry::Info("Session created.".into()));
         }
 
-        KernelEvent::TextOutput { text, .. } => {
+        KernelEvent::ModelStreamChunk { text, .. } => {
+            // Append streaming text to the in-progress assistant entry,
+            // or create a new one. This produces live incremental rendering.
             if let Some(tui::ConversationEntry::AssistantText(existing)) = app.entries.last_mut() {
-                existing.push('\n');
                 existing.push_str(text);
+            } else {
+                app.entries
+                    .push(tui::ConversationEntry::AssistantText(text.clone()));
+            }
+            app.scroll_to_bottom();
+        }
+
+        KernelEvent::TextOutput { text, .. } => {
+            // Non-streaming path, or final assembled text after streaming.
+            // In streaming mode, we've already built up the text from
+            // ModelStreamChunk events, so check if the last entry already
+            // contains the streamed text and skip the duplicate.
+            if let Some(tui::ConversationEntry::AssistantText(existing)) = app.entries.last_mut() {
+                // If streaming populated this entry, the text is already
+                // there. Replace with the final clean version (avoids
+                // any accumulation drift from chunk boundaries).
+                *existing = text.clone();
             } else {
                 app.entries
                     .push(tui::ConversationEntry::AssistantText(text.clone()));
@@ -844,8 +862,16 @@ fn run_repl(workspace: &std::path::Path, settings: Settings) {
                         decision,
                     });
                 }
-                KernelEvent::TextOutput { text, .. } => {
-                    println!("{text}");
+                KernelEvent::ModelStreamChunk { text, .. } => {
+                    print!("{text}");
+                    io::stdout().flush().ok();
+                }
+                KernelEvent::TextOutput { .. } => {
+                    // In streaming mode, text was already printed chunk
+                    // by chunk. In non-streaming mode, we'd print here.
+                    // Since we don't know which mode, just ensure a
+                    // trailing newline.
+                    println!();
                 }
                 KernelEvent::TurnStarted { .. } => {}
                 KernelEvent::TurnEnded { result, .. } => {

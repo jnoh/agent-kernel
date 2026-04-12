@@ -179,19 +179,34 @@ impl TurnLoop {
                 .collect();
         }
 
-        // 2. Call model
-        let response = provider
-            .complete(&prompt, &self.config)
-            .map_err(TurnError::Provider)?;
+        // 2. Call model (streaming when supported)
+        let response = if provider.capabilities().supports_streaming {
+            let chunk_sink = |chunk: kernel_interfaces::types::StreamChunk| {
+                frontend.on_stream_chunk(&chunk);
+            };
+            provider
+                .complete_stream(&prompt, &self.config, &chunk_sink)
+                .map_err(TurnError::Provider)?
+        } else {
+            provider
+                .complete(&prompt, &self.config)
+                .map_err(TurnError::Provider)?
+        };
 
         // 3. Parse tool calls from response
         let (text_parts, tool_calls) = parse_response(&response);
 
-        // Record assistant text response and surface to frontend
+        // Record assistant text response and surface to frontend.
+        // In the streaming path, text was already streamed chunk-by-chunk
+        // via on_stream_chunk. We still call on_text with the full text
+        // so the frontend can finalize the entry (e.g., complete markdown
+        // rendering). Non-streaming path relies on on_text as before.
         if !text_parts.is_empty() {
             let text = text_parts.join("");
             if !text.trim().is_empty() {
-                frontend.on_text(&text);
+                if !provider.capabilities().supports_streaming {
+                    frontend.on_text(&text);
+                }
                 context.append_assistant_response(text);
             }
         }

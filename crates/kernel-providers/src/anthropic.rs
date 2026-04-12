@@ -7,7 +7,8 @@
 use kernel_interfaces::provider::{
     ProviderCaps, ProviderError, ProviderInterface, Response, StopReason, Usage,
 };
-use kernel_interfaces::types::{CompletionConfig, Content, Message, Prompt, Role};
+use kernel_interfaces::types::{CompletionConfig, Content, Message, Prompt, Role, StreamChunk};
+use std::io::BufRead;
 
 pub struct AnthropicProvider {
     api_key: String,
@@ -130,6 +131,193 @@ impl AnthropicProvider {
             Err(e) => Err(ProviderError::Network(format!("{e:#}"))),
         }
     }
+
+    fn send_streaming_request(
+        &self,
+        body_str: &str,
+        on_chunk: &dyn Fn(StreamChunk),
+    ) -> Result<Response, ProviderError> {
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+            .build()
+            .new_agent();
+        let response = agent
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .send(body_str.as_bytes());
+
+        match response {
+            Ok(resp) => {
+                let reader = std::io::BufReader::new(resp.into_body().into_reader());
+                parse_sse_stream(reader, on_chunk)
+            }
+            Err(ureq::Error::StatusCode(429)) => Err(ProviderError::RateLimited {
+                retry_after_secs: None,
+            }),
+            Err(ureq::Error::StatusCode(status)) => {
+                let message = format!("HTTP {status}");
+                Err(ProviderError::Api { status, message })
+            }
+            Err(e) => Err(ProviderError::Network(format!("{e:#}"))),
+        }
+    }
+}
+
+/// Parse an Anthropic SSE stream into StreamChunks + a final Response.
+fn parse_sse_stream<R: BufRead>(
+    reader: R,
+    on_chunk: &dyn Fn(StreamChunk),
+) -> Result<Response, ProviderError> {
+    let mut content: Vec<Content> = Vec::new();
+    let mut usage = Usage::default();
+    let mut stop_reason = StopReason::EndTurn;
+
+    // Per-block accumulators
+    let mut current_text = String::new();
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut current_tool_json = String::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| ProviderError::Network(format!("SSE read: {e}")))?;
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(data)
+            .map_err(|e| ProviderError::Parse(format!("SSE JSON: {e}")))?;
+
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match event_type {
+            "content_block_start" => {
+                let block = event
+                    .get("content_block")
+                    .unwrap_or(&serde_json::Value::Null);
+                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if block_type == "tool_use" {
+                    // Flush any accumulated text
+                    if !current_text.is_empty() {
+                        content.push(Content::Text(std::mem::take(&mut current_text)));
+                    }
+                    current_tool_id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    current_tool_name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    current_tool_json.clear();
+                    on_chunk(StreamChunk::ToolCallStart {
+                        id: current_tool_id.clone(),
+                        name: current_tool_name.clone(),
+                    });
+                }
+            }
+            "content_block_delta" => {
+                let delta = event.get("delta").unwrap_or(&serde_json::Value::Null);
+                let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match delta_type {
+                    "text_delta" => {
+                        let text = delta
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !text.is_empty() {
+                            current_text.push_str(&text);
+                            on_chunk(StreamChunk::Text(text));
+                        }
+                    }
+                    "input_json_delta" => {
+                        let partial = delta
+                            .get("partial_json")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        current_tool_json.push_str(partial);
+                        on_chunk(StreamChunk::ToolCallDelta {
+                            id: current_tool_id.clone(),
+                            input_json: partial.to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                if !current_tool_id.is_empty() {
+                    let input: serde_json::Value =
+                        serde_json::from_str(&current_tool_json).unwrap_or_default();
+                    content.push(Content::ToolCall {
+                        id: std::mem::take(&mut current_tool_id),
+                        name: std::mem::take(&mut current_tool_name),
+                        input,
+                    });
+                    current_tool_json.clear();
+                    on_chunk(StreamChunk::ToolCallEnd {
+                        id: content
+                            .last()
+                            .and_then(|c| match c {
+                                Content::ToolCall { id, .. } => Some(id.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+            "message_delta" => {
+                let delta = event.get("delta").unwrap_or(&serde_json::Value::Null);
+                stop_reason = match delta.get("stop_reason").and_then(|v| v.as_str()) {
+                    Some("tool_use") => StopReason::ToolUse,
+                    Some("max_tokens") => StopReason::MaxTokens,
+                    Some("stop_sequence") => StopReason::StopSequence,
+                    _ => StopReason::EndTurn,
+                };
+                if let Some(u) = event.get("usage") {
+                    usage.output_tokens =
+                        u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                }
+            }
+            "message_start" => {
+                if let Some(msg) = event.get("message")
+                    && let Some(u) = msg.get("usage")
+                {
+                    usage.input_tokens =
+                        u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    usage.cache_creation_input_tokens =
+                        u.get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                    usage.cache_read_input_tokens = u
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                }
+            }
+            "message_stop" => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Flush remaining text
+    if !current_text.is_empty() {
+        content.push(Content::Text(current_text));
+    }
+
+    on_chunk(StreamChunk::Done);
+
+    Ok(Response {
+        content,
+        usage,
+        stop_reason,
+    })
 }
 
 /// Whether a `ProviderError` is transient and worth retrying.
@@ -192,6 +380,50 @@ impl ProviderInterface for AnthropicProvider {
         Err(last_err.unwrap_or_else(|| ProviderError::Network("retry exhausted".into())))
     }
 
+    fn complete_stream(
+        &self,
+        prompt: &Prompt,
+        config: &CompletionConfig,
+        on_chunk: &dyn Fn(StreamChunk),
+    ) -> Result<Response, ProviderError> {
+        let mut body = self.build_request_body(prompt, config);
+        body["stream"] = serde_json::json!(true);
+        let body_str = serde_json::to_string(&body)
+            .map_err(|e| ProviderError::Parse(format!("failed to serialize request: {e}")))?;
+
+        let mut last_err: Option<ProviderError> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let base_delay = match &last_err {
+                    Some(ProviderError::RateLimited {
+                        retry_after_secs: Some(secs),
+                    }) => *secs as f64,
+                    _ => (1u64 << (attempt - 1).min(4)) as f64,
+                };
+                let jitter = 0.75 + (attempt as f64 * 0.1 % 0.5);
+                let delay = std::time::Duration::from_secs_f64(base_delay * jitter);
+                std::thread::sleep(delay.min(std::time::Duration::from_secs(30)));
+            }
+
+            let result = self.send_streaming_request(&body_str, on_chunk);
+            match result {
+                Ok(resp) => return Ok(resp),
+                Err(ref e) if is_transient(e) && attempt < MAX_RETRIES => {
+                    eprintln!(
+                        "  [provider] transient error (attempt {}/{}): {e}",
+                        attempt + 1,
+                        MAX_RETRIES + 1
+                    );
+                    last_err = Some(result.unwrap_err());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| ProviderError::Network("retry exhausted".into())))
+    }
+
     fn count_tokens(&self, content: &Content) -> usize {
         match content {
             Content::Text(t) => t.len() / 4,
@@ -204,7 +436,7 @@ impl ProviderInterface for AnthropicProvider {
         ProviderCaps {
             supports_tool_use: true,
             supports_vision: false,
-            supports_streaming: false,
+            supports_streaming: true,
             max_context_tokens: 200_000,
         }
     }

@@ -1,4 +1,4 @@
-use crate::types::{CompletionConfig, Content, Prompt};
+use crate::types::{CompletionConfig, Content, Prompt, StreamChunk};
 use std::fmt;
 
 /// Errors from provider operations.
@@ -77,6 +77,38 @@ pub trait ProviderInterface {
         prompt: &Prompt,
         config: &CompletionConfig,
     ) -> Result<Response, ProviderError>;
+
+    /// Streaming completion. Calls `on_chunk` for each incremental piece
+    /// of the response, then returns the fully assembled `Response`.
+    /// Default implementation falls back to `complete()` and synthesizes
+    /// chunks from the assembled response.
+    fn complete_stream(
+        &self,
+        prompt: &Prompt,
+        config: &CompletionConfig,
+        on_chunk: &dyn Fn(StreamChunk),
+    ) -> Result<Response, ProviderError> {
+        let response = self.complete(prompt, config)?;
+        for c in &response.content {
+            match c {
+                Content::Text(t) => on_chunk(StreamChunk::Text(t.clone())),
+                Content::ToolCall { id, name, input } => {
+                    on_chunk(StreamChunk::ToolCallStart {
+                        id: id.clone(),
+                        name: name.clone(),
+                    });
+                    on_chunk(StreamChunk::ToolCallDelta {
+                        id: id.clone(),
+                        input_json: input.to_string(),
+                    });
+                    on_chunk(StreamChunk::ToolCallEnd { id: id.clone() });
+                }
+                _ => {}
+            }
+        }
+        on_chunk(StreamChunk::Done);
+        Ok(response)
+    }
 
     /// Token counting for budget management.
     fn count_tokens(&self, content: &Content) -> usize;

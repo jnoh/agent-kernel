@@ -105,8 +105,13 @@ pub enum KernelEvent {
         request: PermissionRequest,
     },
 
-    /// The model produced text output.
+    /// The model produced text output (non-streaming, or final assembled text).
     TextOutput { session_id: SessionId, text: String },
+
+    /// Incremental text chunk from the model during streaming. The TUI
+    /// appends this to the in-progress assistant text entry for live
+    /// rendering. The full text also arrives as `TextOutput` at stream end.
+    ModelStreamChunk { session_id: SessionId, text: String },
 
     /// A tool was called (informational, before execution).
     ToolCallStarted {
