@@ -18,7 +18,7 @@ The kernel is not an agent. It is the thing agents are built on. Different agent
 - A context manager with tiered memory and opinionated compaction
 - A permission evaluator with policy-file-driven dispatch gating
 - A session manager (single-session in v0.1, multi-session interface defined for v0.2)
-- Six stable module interfaces: ProviderInterface, ToolRegistration, ChannelInterface, FrontendEvents, SessionControl, PolicyInterface
+- Seven stable module interfaces: ProviderInterface, ToolRegistration, ChannelInterface, FrontendEvents, SessionControl, PolicyInterface, SessionEventSink
 - Two kernel-internal tools: `request_tool` (demand-paging) and `plan` (scratchpad access)
 - Three-path tool loading: native Rust crates, external processes (JSON-RPC over stdin/stdout), MCP bridge
 - A reference TUI frontend
@@ -222,7 +222,7 @@ The context manager owns the token budget. It is the only subsystem with global 
 
 Tier 3 is not abstract. Every mutation to the in-memory view — `append_user_input`, `append_assistant_response`, `append_tool_exchange`, `append_system_message`, plus a once-per-session `record_session_started` — fans out through a `SessionEventSink` trait to an append-only `SessionEvent` stream before the view itself is touched. The stream is the authoritative session record; the `ContextStore` is a derivable projection of it. The record-before-mutate ordering makes "the stream is the truth" a structural invariant: a crash between record and mutate leaves the stream slightly ahead, which is recoverable; the opposite ordering is not.
 
-Four sinks ship in `kernel-core`: `NullSink` (drops every event — the default for unit tests and in-process library callers), `FileSink` (appends one JSON object per line to a specified path, `u64` millisecond timestamps, serde-tagged variants), `HttpSink` (POSTs each event as a single JSON object to `<endpoint>/events` over a hand-rolled `std::net::TcpStream` HTTP/1.1 client — no dependencies, `http://` only, optional bearer token, 2-second timeout, audit-only fire-and-forget with a `failed_writes` counter), and `TeeSink<A, B>` (a generic composite that fans `record()` out to two inner sinks). `SessionEventSink` is also implemented for `Box<dyn SessionEventSink>`, so `TeeSink` can hold a runtime-selected primary sink alongside a concrete secondary. `ContextManager` exposes `new`, `with_store`, `with_event_sink`, and `with_store_and_events` constructors so test and production call sites can mix-and-match store and sink independently. `FileSink` and `HttpSink` both expose `failed_writes()` for observability — a non-zero counter means the stream is no longer authoritative for that sink.
+The `SessionEventSink` trait, the `SessionEvent` enum, and the `WorkspaceFingerprint` / `FingerprintMatch` types live in `kernel-interfaces` (see §4.6) — distributions can implement a custom sink (SQLite, Postgres, cloud object store) by depending only on the stable API crate. Concrete sink impls and runtime helpers stay in `kernel-core`. Four sinks ship in `kernel-core`: `NullSink` (drops every event — the default for unit tests and in-process library callers), `FileSink` (appends one JSON object per line to a specified path, `u64` millisecond timestamps, serde-tagged variants), `HttpSink` (POSTs each event as a single JSON object to `<endpoint>/events` over a hand-rolled `std::net::TcpStream` HTTP/1.1 client — no dependencies, `http://` only, optional bearer token, 2-second timeout, audit-only fire-and-forget with a `failed_writes` counter), and `TeeSink<A, B>` (a generic composite that fans `record()` out to two inner sinks). `SessionEventSink` is also implemented for `Box<dyn SessionEventSink>`, so `TeeSink` can hold a runtime-selected primary sink alongside a concrete secondary. `ContextManager` exposes `new`, `with_store`, `with_event_sink`, and `with_store_and_events` constructors so test and production call sites can mix-and-match store and sink independently. `FileSink` and `HttpSink` both expose `failed_writes()` for observability — a non-zero counter means the stream is no longer authoritative for that sink.
 
 The `kernel-daemon` router wires a `FileSink` for every session it creates, resolving the path via `session_events::default_events_path(session_id)`. The base directory is `$AGENT_KERNEL_HOME` if set, else `$HOME/.agent-kernel`, else `./.agent-kernel`; the events file lives at `<base>/sessions/{id}/events.jsonl`. Sessions are globally addressable — the workspace is recorded inside the `SessionStarted` event as metadata, not encoded in the filesystem path, so any past session's events can be located without knowing the original workspace. If `FileSink::new` fails (unwritable base directory) the daemon falls back to `NullSink` with a stderr warning rather than aborting session creation. If `AGENT_KERNEL_REMOTE_SINK_URL` is set, the router additionally constructs an `HttpSink` (with optional `AGENT_KERNEL_REMOTE_SINK_TOKEN` bearer auth) and wraps both sinks in a `TeeSink` so every event is mirrored to the remote endpoint for one-way audit/archival; a malformed URL logs to stderr and falls back to local-only, and remote delivery failures are counted but never block the turn loop. True remote session execution and remote hydration are out of scope here — the kernel still runs locally.
 
@@ -810,6 +810,25 @@ Autonomous sessions can be **promoted** to interactive. When a webhook-spawned a
 
 **For v0.1:** no channel modules ship. The TUI acts as both frontend and channel for a single interactive session. The `ChannelInterface` exists so that v0.2 can add webhook support, Slack adapters, and cron scheduling without modifying the core.
 
+### 4.6 SessionEventSink
+
+The Tier-3 storage abstraction (see §3.2). A sink receives every `SessionEvent` the context manager emits before the in-memory view is mutated, making the stream the authoritative session record. The trait, the `SessionEvent` enum, and the `WorkspaceFingerprint` / `FingerprintMatch` types live in `kernel-interfaces` so a distribution can back the stream with its own storage — SQLite, Postgres, a cloud object store — by depending only on the stable API crate.
+
+```rust
+trait SessionEventSink: Send {
+    /// The session this sink records events for.
+    fn session_id(&self) -> &str;
+
+    /// Append an event. Fire-and-forget: errors are counted, not propagated,
+    /// so a failing sink never blocks the turn loop.
+    fn record(&self, event: &SessionEvent);
+}
+```
+
+`SessionEventSink` is also implemented for `Box<dyn SessionEventSink>`, which lets `TeeSink` hold a runtime-selected primary alongside a concrete secondary. Concrete impls (`NullSink`, `FileSink`, `HttpSink`, `TeeSink`) and runtime helpers (`fingerprint_workspace`, `read_events_from_file`, `default_events_path`, `now_millis`) stay in `kernel-core` — they touch the filesystem, subprocesses, env vars, and the clock, so they belong in runtime code. The `kernel-interfaces` crate picks up no new dependencies from the move; `serde` and `serde_json` cover the promoted types.
+
+**For v0.1:** the only sinks that ship are the four in `kernel-core`. The trait exists on the stable surface so that v0.2 distributions can add their own storage backends without forking the kernel.
+
 ---
 
 ## 5. Security Architecture
@@ -1089,7 +1108,7 @@ Every commit carries metadata:
 
 ### Stable interface guarantee
 
-The six module interfaces (ProviderInterface, ToolRegistration, ChannelInterface, FrontendEvents, SessionControl, PolicyInterface) are versioned and follow a three-stage maturity model inspired by Kubernetes API lifecycle:
+The seven module interfaces (ProviderInterface, ToolRegistration, ChannelInterface, FrontendEvents, SessionControl, PolicyInterface, SessionEventSink) are versioned and follow a three-stage maturity model inspired by Kubernetes API lifecycle:
 
 **Experimental** — opt-in only (behind a feature flag), may change or disappear without notice, not available in stable builds. New interface additions start here.
 

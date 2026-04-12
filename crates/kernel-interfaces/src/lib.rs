@@ -4,5 +4,6 @@ pub mod frontend;
 pub mod policy;
 pub mod protocol;
 pub mod provider;
+pub mod session_events;
 pub mod tool;
 pub mod types;

@@ -1,74 +1,28 @@
-//! Append-only session event stream (Tier-3 storage).
+//! Runtime Tier-3 storage implementations.
 //!
-//! The event stream is the **authoritative** record of a session. Every
-//! user input, assistant response, tool exchange, and system message the
-//! `ContextManager` sees is recorded as a `SessionEvent` before the
-//! in-memory store is mutated. The stream is never modified after write
-//! — compaction operates on the view (`ContextStore`), not on the event
-//! stream.
+//! The abstraction — `SessionEventSink` trait, `SessionEvent` enum, and
+//! `WorkspaceFingerprint` types — was promoted to `kernel-interfaces`
+//! in spec 0009 so future distributions can implement custom sinks
+//! without depending on `kernel-core`. This module re-exports those
+//! items at their original `kernel_core::session_events::...` paths
+//! so every existing in-core consumer keeps compiling unchanged.
 //!
-//! This module ships storage only. Model-accessible event queries, rewind,
-//! and projection-based compaction are separate specs layered on top.
-//!
-//! The module is named `session_events` rather than `conversation_log`
-//! because the stream is not restricted to conversation turns — future
-//! specs will add permission decisions, policy changes, and compaction
-//! events to it.
+//! What *stays* here: concrete impls (`NullSink`, `FileSink`,
+//! `HttpSink`, `TeeSink`) and runtime helpers (`read_events_from_file`,
+//! `fingerprint_workspace`, `default_events_path`, `now_millis`). All
+//! of them touch filesystem, subprocess, env vars, or the clock —
+//! runtime code, not interface-crate material.
+
+pub use kernel_interfaces::session_events::{
+    FingerprintMatch, SessionEvent, SessionEventSink, WorkspaceFingerprint,
+};
 
 use kernel_interfaces::types::SessionId;
-use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// Git-state fingerprint of a workspace at session-create time (spec 0008).
-///
-/// Recorded once in `SessionStarted` and compared against the current
-/// workspace during hydration (if the caller asks). This is the minimum
-/// viable workspace-sync primitive: it doesn't move files, but it lets a
-/// replay refuse to run against the wrong commit.
-///
-/// Non-git workspaces produce a fingerprint with `commit=None,
-/// branch=None, dirty=false` — the workspace is recorded by path only,
-/// and match semantics treat non-git state as `Unknown`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct WorkspaceFingerprint {
-    pub commit: Option<String>,
-    pub branch: Option<String>,
-    pub dirty: bool,
-    pub workspace_path: String,
-}
-
-/// Result of comparing two `WorkspaceFingerprint`s (spec 0008).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FingerprintMatch {
-    /// Commits match and both are clean.
-    Identical,
-    /// Commits match but at least one side has uncommitted changes.
-    SameCommitDirty,
-    /// Commits differ.
-    CommitMismatch,
-    /// One or both lack git info — can't compare.
-    Unknown,
-}
-
-impl WorkspaceFingerprint {
-    pub fn matches(&self, other: &Self) -> FingerprintMatch {
-        match (&self.commit, &other.commit) {
-            (Some(a), Some(b)) if a == b => {
-                if self.dirty || other.dirty {
-                    FingerprintMatch::SameCommitDirty
-                } else {
-                    FingerprintMatch::Identical
-                }
-            }
-            (Some(_), Some(_)) => FingerprintMatch::CommitMismatch,
-            _ => FingerprintMatch::Unknown,
-        }
-    }
-}
 
 /// Capture the workspace's git state. Best-effort: if git is missing,
 /// if the path isn't a repo, or any git call fails, returns a
@@ -118,74 +72,6 @@ pub fn fingerprint_workspace(path: &Path) -> WorkspaceFingerprint {
         branch,
         dirty,
         workspace_path: canonical,
-    }
-}
-
-/// One event in the session's event stream.
-///
-/// Events are serialized one-per-line as JSON (JSONL). Each carries a
-/// millisecond UNIX timestamp and the zero-based `turn_index` at the time
-/// of the event.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-pub enum SessionEvent {
-    SessionStarted {
-        timestamp_ms: u64,
-        turn_index: usize,
-        workspace: String,
-        system_prompt: String,
-        policy_name: String,
-        /// Git fingerprint of the workspace at session-create time
-        /// (spec 0008). `None` for older event files or when the
-        /// caller didn't capture one.
-        #[serde(default)]
-        fingerprint: Option<WorkspaceFingerprint>,
-    },
-    UserInput {
-        timestamp_ms: u64,
-        turn_index: usize,
-        text: String,
-    },
-    AssistantResponse {
-        timestamp_ms: u64,
-        turn_index: usize,
-        text: String,
-    },
-    ToolExchange {
-        timestamp_ms: u64,
-        turn_index: usize,
-        tool_name: String,
-        input: serde_json::Value,
-        result: serde_json::Value,
-    },
-    SystemMessage {
-        timestamp_ms: u64,
-        turn_index: usize,
-        text: String,
-    },
-}
-
-/// Append-only sink for `SessionEvent` values.
-///
-/// Implementations must be append-only and must not modify previously
-/// written events. Writes are best-effort: failures are non-fatal and
-/// surfaced via stderr + an internal counter, so a broken disk cannot
-/// stall the turn loop.
-pub trait SessionEventSink: Send {
-    fn session_id(&self) -> SessionId;
-    fn record(&mut self, event: SessionEvent);
-}
-
-/// Forwarding impl so `Box<dyn SessionEventSink>` is itself a
-/// `SessionEventSink`. Required by `TeeSink<A, B>` when either half
-/// needs to hold a trait object (e.g., the daemon's local sink,
-/// which is `FileSink` or `NullSink` depending on runtime state).
-impl SessionEventSink for Box<dyn SessionEventSink> {
-    fn session_id(&self) -> SessionId {
-        (**self).session_id()
-    }
-    fn record(&mut self, event: SessionEvent) {
-        (**self).record(event);
     }
 }
 
