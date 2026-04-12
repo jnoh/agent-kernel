@@ -2,23 +2,23 @@
 
 ## Project Overview
 
-agent-kernel is a Rust runtime layer for building AI agents. It provides core primitives (context management, tool dispatch, permission evaluation) that agent "distributions" build on top of — analogous to how Linux distributions build on the Linux kernel.
+agent-kernel is a Rust runtime for building AI agents. It provides core primitives (context management, tool dispatch, permission evaluation) that agent "distributions" build on top of — configured via TOML manifests, not code changes.
 
 ## Repository Structure
 
 ```
 agent-kernel/
 ├── crates/
-│   ├── kernel-interfaces/   # Trait definitions and shared types (the stable API)
-│   ├── kernel-core/         # Core runtime: turn loop, context, permissions, sessions, event stream
-│   ├── kernel-providers/    # First-party ProviderInterface impls (Anthropic, Echo)
-│   ├── kernel-daemon/       # Unix-socket daemon that hosts sessions
-│   └── dist-code-agent/     # Reference coding-agent distribution (binary: agent-kernel)
-├── distros/                 # Distribution manifests (code-agent.toml); the binary reads one at startup
-├── docs/                    # Architecture spec, design proposals, spec protocol, roadmap
-├── policies/                # YAML policy files (permissive.yaml, lockdown.yaml)
-├── specs/                   # Scoped work units (see docs/spec-protocol.md)
-├── Cargo.toml               # Workspace root (resolver v2, edition 2024)
+│   ├── kernel-interfaces/       # Trait definitions and shared types (the stable API)
+│   ├── kernel-core/             # Runtime: turn loop, context, permissions, sessions, MCP client, toolset pool
+│   ├── kernel-providers/        # First-party ProviderInterface impls (Anthropic, Echo)
+│   ├── kernel-workspace-local/  # MCP server binary + library for the six workspace tools
+│   └── agent-kernel/            # The binary: loads manifest, wires everything, runs TUI/REPL
+├── distros/                     # Distribution manifests (code-agent.toml)
+├── docs/                        # Architecture spec, design proposals, spec protocol, roadmap
+├── policies/                    # YAML policy files (permissive.yaml, lockdown.yaml)
+├── specs/                       # Scoped work units (see docs/spec-protocol.md)
+├── Cargo.toml                   # Workspace root (resolver v2, edition 2024)
 └── CLAUDE.md
 ```
 
@@ -27,20 +27,38 @@ agent-kernel/
 ```
 kernel-interfaces   (leaf — no internal deps)
        ↑
-       ├── kernel-core       (runtime primitives)
-       ├── kernel-providers  (depends on kernel-interfaces only)
-       └── dist-code-agent   (depends on kernel-interfaces only; talks to daemon over socket)
-              ↑
-       kernel-daemon   (depends on kernel-interfaces + kernel-core + kernel-providers)
+       ├── kernel-core          (runtime + MCP client + toolset pool)
+       ├── kernel-providers     (depends on kernel-interfaces only)
+       └── agent-kernel         (the binary — depends on all of the above)
 ```
 
 ### Key Crates
 
-- **kernel-interfaces**: Seven stable traits (`ProviderInterface`, `ToolRegistration`, `ChannelInterface`, `FrontendEvents`, `SessionControl`, `PolicyInterface`, `SessionEventSink`) plus shared types (`Capability`, `Content`, `ToolOutput`, `SessionEvent`, `WorkspaceFingerprint`). The stable API surface — distributions depend only on this crate.
-- **kernel-core**: The runtime — turn loop, context manager, permission evaluator, session manager, event loop, Tier-3 sink impls (`NullSink`, `FileSink`, `HttpSink`, `TeeSink`), hydration / replay.
-- **kernel-providers**: First-party `ProviderInterface` implementations — currently `AnthropicProvider` (real Claude API via `ureq`) and `EchoProvider` (stub fallback).
-- **kernel-daemon**: Long-running process that listens on a Unix socket, wires up `EventLoop`s, picks a provider from `kernel-providers` at session-create time based on `ANTHROPIC_API_KEY`, and routes events back to connected distributions.
-- **dist-code-agent**: A reference distribution that wires together filesystem tools and a TUI frontend into a working coding agent binary (`agent-kernel`). Talks to `kernel-daemon` over a Unix socket; never touches `kernel-core` at runtime.
+- **kernel-interfaces**: Stable trait API (`ProviderInterface`, `ToolRegistration`, `ToolSet`, `FrontendEvents`, `SessionControl`, `PolicyInterface`, `SessionEventSink`) plus shared types. The extension-point boundary.
+- **kernel-core**: The runtime — turn loop, context manager, permission evaluator, session manager, event loop, MCP stdio client (`mcp_stdio.rs`), toolset pool, Tier-3 sink impls.
+- **kernel-providers**: Concrete `ProviderInterface` implementations — `AnthropicProvider` (real Claude API via `ureq`) and `EchoProvider` (stub fallback).
+- **kernel-workspace-local**: An MCP server binary (`kernel-workspace-local`) that exposes six workspace tools (file_read, file_write, file_edit, shell, ls, grep) over newline-delimited JSON-RPC on stdio. Also a library crate exporting tool structs and `TOOL_NAMES`.
+- **agent-kernel**: The single binary. Loads a manifest, builds provider + toolset pool, creates a session with direct crossbeam channels (no IPC), runs the TUI or REPL.
+
+### TUI Module Map
+
+The TUI lives in `crates/agent-kernel/src/tui/`. Each conversation block type has its own renderer under `blocks/`. To add a new block type: add a variant to `ConversationEntry` in `types.rs`, create a renderer in `blocks/`, add a match arm in `conversation.rs`.
+
+```
+tui/
+  mod.rs           — App struct, draw() top-level layout, terminal lifecycle, re-exports
+  theme.rs         — Theme struct (centralized colors)
+  types.rs         — ConversationEntry, ToolCallStatus, SlashCommand, InputAction, parse_slash_command
+  status_bar.rs    — status bar rendering
+  input.rs         — input area rendering, key/mouse handling, history navigation
+  conversation.rs  — iterates entries, dispatches to block renderers, scroll/wrap math
+  blocks/
+    user.rs        — UserInput rendering ("> " prefix)
+    assistant.rs   — AssistantText + markdown_to_lines (pulldown-cmark)
+    tool_call.rs   — ToolCall box: compact one-liner (collapsed) or full box (expanded/running)
+    permission.rs  — PermissionPrompt rendering ([y/n/a])
+    info.rs        — Info + Error one-liners
+```
 
 ## Build / Verify / Test Loop
 
@@ -69,12 +87,17 @@ cargo fmt
 cargo fmt -- --check && cargo clippy && cargo test
 ```
 
-`kernel-interfaces` unit tests cover policy evaluation, tool output, and capability matching. `dist-code-agent` integration tests exercise real filesystem operations via `tempfile`.
+**Running the binary** (requires `kernel-workspace-local` on PATH):
+```bash
+cargo build --workspace
+export PATH="$(pwd)/target/debug:$PATH"
+cargo run -p agent-kernel -- --manifest distros/code-agent.toml
+```
 
 ## Code Conventions
 
 - **Rust edition 2024**, workspace version `0.1.0`
-- Traits live in `kernel-interfaces`; implementations live in `kernel-core` or distribution crates
+- Traits live in `kernel-interfaces`; implementations live in `kernel-core` or the binary crate
 - Errors use `Result` with domain-specific error enums (e.g., `ProviderError`)
 - Serialization via `serde` + `serde_json`; policy files use `serde_yaml`
 - Tests go in `mod tests` blocks within each source file (standard Rust convention)
@@ -85,7 +108,10 @@ cargo fmt -- --check && cargo clippy && cargo test
 - **Turn loop** (`kernel-core/src/turn_loop.rs`): The main execution loop — assembles prompt, calls model, dispatches tools, feeds results back.
 - **Permission evaluator** (`kernel-core/src/permission.rs`): Policy-file-driven dispatch gating with first-match-wins semantics.
 - **Context manager** (`kernel-core/src/context.rs`): Tiered memory with token budgets and invalidation tracking.
-- **Session manager** (`kernel-core/src/session.rs`): Single-session.
+- **MCP stdio client** (`kernel-core/src/mcp_stdio.rs`): Spawns MCP tool subprocesses, runs JSON-RPC handshake, proxies `tools/call` with streaming chunk support.
+- **Toolset pool** (`kernel-core/src/toolset_pool.rs`): Builds `ToolSet` instances from manifest `[[toolset]]` entries via a factory registry. Default registry registers `mcp.stdio`.
+- **Session** (`kernel-core/src/session.rs`): Single-session; owns context, permissions, turn loop, tool list.
+- **Event loop** (`kernel-core/src/event_loop.rs`): Per-session thread; receives `KernelRequest` from the frontend, drives the session, emits `KernelEvent` back.
 - Policy files in `policies/` define capability rules (allow/deny/ask) per tool category.
 
 ## Spec-driven workflow
