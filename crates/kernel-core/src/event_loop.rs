@@ -88,7 +88,13 @@ impl EventLoop {
             sc.system_prompt.clone(),
             config.events,
         );
-        context.record_session_started(sc.workspace.clone(), sc.policy.name.clone());
+        let fingerprint =
+            crate::session_events::fingerprint_workspace(std::path::Path::new(&sc.workspace));
+        context.record_session_started(
+            sc.workspace.clone(),
+            sc.policy.name.clone(),
+            Some(fingerprint),
+        );
 
         let permission = PermissionEvaluator::new(sc.policy);
         let turn_loop = TurnLoop::new(

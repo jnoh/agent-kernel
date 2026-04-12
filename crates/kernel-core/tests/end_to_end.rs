@@ -839,6 +839,7 @@ fn e2e_hydrate_roundtrip() {
             SessionMode::Interactive,
             PathBuf::from("/tmp/test-workspace"),
             Vec::new(),
+            false, // verify_workspace: skip; /tmp/test-workspace isn't a git repo
         )
         .expect("hydrate should succeed");
 

@@ -370,6 +370,8 @@ The session snapshot carries full state: scratchpad, token accounting, compactio
 ### Workspace sync
 The hard part of migration isn't the session — it's the workspace. The session references files that must exist on the target. Git is the natural transport: push before migrate, pull on the other side. The kernel could automate this as part of the migration flow (push, snapshot, transfer, pull, hydrate), but the first implementation should be manual (`git push` yourself, then migrate).
 
+**Status:** The minimum-viable primitive shipped in spec 0008. `SessionEvent::SessionStarted` now carries an optional `WorkspaceFingerprint` (commit, branch, dirty, absolute path) captured via `fingerprint_workspace` at session-create time, and `SessionManager::hydrate_from_events` accepts a `verify_workspace` flag that rejects hydration on commit mismatch. This doesn't move any files — it's purely a safety rail so the manual "git push / git pull / hydrate" workflow notices when the target workspace is on the wrong commit. Full automated push/pull/verify is still future work.
+
 ### When to build
 Remote execution (TCP socket + auth) is useful on its own without migration — it lets you run headless agents on a server. Build that first. Migration is a natural follow-on once checkpointing works.
 

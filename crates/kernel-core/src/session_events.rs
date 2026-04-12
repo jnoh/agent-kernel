@@ -23,6 +23,104 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Git-state fingerprint of a workspace at session-create time (spec 0008).
+///
+/// Recorded once in `SessionStarted` and compared against the current
+/// workspace during hydration (if the caller asks). This is the minimum
+/// viable workspace-sync primitive: it doesn't move files, but it lets a
+/// replay refuse to run against the wrong commit.
+///
+/// Non-git workspaces produce a fingerprint with `commit=None,
+/// branch=None, dirty=false` — the workspace is recorded by path only,
+/// and match semantics treat non-git state as `Unknown`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceFingerprint {
+    pub commit: Option<String>,
+    pub branch: Option<String>,
+    pub dirty: bool,
+    pub workspace_path: String,
+}
+
+/// Result of comparing two `WorkspaceFingerprint`s (spec 0008).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintMatch {
+    /// Commits match and both are clean.
+    Identical,
+    /// Commits match but at least one side has uncommitted changes.
+    SameCommitDirty,
+    /// Commits differ.
+    CommitMismatch,
+    /// One or both lack git info — can't compare.
+    Unknown,
+}
+
+impl WorkspaceFingerprint {
+    pub fn matches(&self, other: &Self) -> FingerprintMatch {
+        match (&self.commit, &other.commit) {
+            (Some(a), Some(b)) if a == b => {
+                if self.dirty || other.dirty {
+                    FingerprintMatch::SameCommitDirty
+                } else {
+                    FingerprintMatch::Identical
+                }
+            }
+            (Some(_), Some(_)) => FingerprintMatch::CommitMismatch,
+            _ => FingerprintMatch::Unknown,
+        }
+    }
+}
+
+/// Capture the workspace's git state. Best-effort: if git is missing,
+/// if the path isn't a repo, or any git call fails, returns a
+/// fingerprint with `commit=None, branch=None, dirty=false` plus the
+/// canonicalized workspace path. Never fails — non-git workspaces are
+/// a valid case.
+pub fn fingerprint_workspace(path: &Path) -> WorkspaceFingerprint {
+    use std::process::Command;
+
+    let canonical = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+
+    let run_git = |args: &[&str]| -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(output.stdout).ok()?;
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    };
+
+    let commit = run_git(&["rev-parse", "HEAD"]);
+    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let dirty = match Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain"])
+        .output()
+    {
+        Ok(out) if out.status.success() => !out.stdout.is_empty(),
+        _ => false,
+    };
+
+    WorkspaceFingerprint {
+        commit,
+        branch,
+        dirty,
+        workspace_path: canonical,
+    }
+}
+
 /// One event in the session's event stream.
 ///
 /// Events are serialized one-per-line as JSON (JSONL). Each carries a
@@ -37,6 +135,11 @@ pub enum SessionEvent {
         workspace: String,
         system_prompt: String,
         policy_name: String,
+        /// Git fingerprint of the workspace at session-create time
+        /// (spec 0008). `None` for older event files or when the
+        /// caller didn't capture one.
+        #[serde(default)]
+        fingerprint: Option<WorkspaceFingerprint>,
     },
     UserInput {
         timestamp_ms: u64,
@@ -753,6 +856,85 @@ mod tests {
             text: "will fail".into(),
         });
         assert!(sink.failed_writes() >= 1);
+    }
+
+    #[test]
+    fn fingerprint_workspace_non_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp = fingerprint_workspace(tmp.path());
+        assert!(
+            fp.commit.is_none(),
+            "non-git dir should have no commit: {fp:?}"
+        );
+        assert!(fp.branch.is_none());
+        assert!(!fp.dirty);
+        assert!(!fp.workspace_path.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_workspace_on_this_repo() {
+        // Fingerprint the project root. If `git` isn't available on the
+        // CI runner we'll get None, which the graceful-degradation path
+        // accepts — in that case the test asserts only that the function
+        // returned cleanly.
+        let fp = fingerprint_workspace(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+        if let Some(commit) = &fp.commit {
+            // 40-char hex for a full SHA, or a shorter abbrev for repos
+            // with --short — either way, non-empty.
+            assert!(!commit.is_empty());
+            assert!(
+                fp.branch.is_some(),
+                "a non-detached HEAD should have a branch"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_fingerprint_matches_semantics() {
+        let a = WorkspaceFingerprint {
+            commit: Some("abc123".into()),
+            branch: Some("main".into()),
+            dirty: false,
+            workspace_path: "/tmp/a".into(),
+        };
+        let a_clone = a.clone();
+        assert_eq!(a.matches(&a_clone), FingerprintMatch::Identical);
+
+        let mut a_dirty = a.clone();
+        a_dirty.dirty = true;
+        assert_eq!(a.matches(&a_dirty), FingerprintMatch::SameCommitDirty);
+        assert_eq!(a_dirty.matches(&a), FingerprintMatch::SameCommitDirty);
+
+        let different = WorkspaceFingerprint {
+            commit: Some("def456".into()),
+            ..a.clone()
+        };
+        assert_eq!(a.matches(&different), FingerprintMatch::CommitMismatch);
+
+        let no_commit = WorkspaceFingerprint {
+            commit: None,
+            branch: None,
+            dirty: false,
+            workspace_path: "/tmp/non-git".into(),
+        };
+        assert_eq!(a.matches(&no_commit), FingerprintMatch::Unknown);
+        assert_eq!(no_commit.matches(&a), FingerprintMatch::Unknown);
+        assert_eq!(no_commit.matches(&no_commit), FingerprintMatch::Unknown);
+    }
+
+    #[test]
+    fn session_started_old_format_deserializes_with_none_fingerprint() {
+        // Simulated pre-0008 event file: SessionStarted without the
+        // `fingerprint` field. Should deserialize cleanly into
+        // `fingerprint: None` thanks to `#[serde(default)]` on the field.
+        let old_json = r#"{"type":"SessionStarted","timestamp_ms":0,"turn_index":0,"workspace":"/tmp","system_prompt":"sys","policy_name":"test"}"#;
+        let event: SessionEvent = serde_json::from_str(old_json).expect("parse old format");
+        match event {
+            SessionEvent::SessionStarted { fingerprint, .. } => {
+                assert!(fingerprint.is_none());
+            }
+            _ => panic!("expected SessionStarted"),
+        }
     }
 
     #[test]

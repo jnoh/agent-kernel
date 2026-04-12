@@ -258,9 +258,44 @@ impl SessionManager {
         mode: kernel_interfaces::types::SessionMode,
         workspace: std::path::PathBuf,
         tools: Vec<Box<dyn ToolRegistration>>,
+        verify_workspace: bool,
     ) -> Result<SessionId, String> {
         let events = crate::session_events::read_events_from_file(events_path)
             .map_err(|e| format!("failed to read event file: {e}"))?;
+
+        if verify_workspace {
+            use crate::session_events::{FingerprintMatch, SessionEvent, fingerprint_workspace};
+            if let Some(SessionEvent::SessionStarted {
+                fingerprint: Some(recorded),
+                ..
+            }) = events.first()
+            {
+                let current = fingerprint_workspace(&workspace);
+                match recorded.matches(&current) {
+                    FingerprintMatch::Identical => {}
+                    FingerprintMatch::SameCommitDirty => {
+                        eprintln!(
+                            "session_events: workspace has uncommitted changes; \
+                             hydrating anyway (commit {:?} matches)",
+                            recorded.commit
+                        );
+                    }
+                    FingerprintMatch::CommitMismatch => {
+                        return Err(format!(
+                            "workspace commit mismatch: recorded {:?}, current {:?}",
+                            recorded.commit, current.commit
+                        ));
+                    }
+                    FingerprintMatch::Unknown => {
+                        eprintln!(
+                            "session_events: workspace fingerprint unknown (non-git?); \
+                             hydrating without verification"
+                        );
+                    }
+                }
+            }
+        }
+
         let context = ContextManager::hydrated_from_events(context_config, &events)?;
 
         let id = SessionId(self.next_id);
@@ -299,9 +334,10 @@ impl SessionManager {
 
         let policy_name = config.policy.name.clone();
         let workspace_str = config.workspace.to_string_lossy().into_owned();
+        let fingerprint = crate::session_events::fingerprint_workspace(&config.workspace);
         let mut context =
             ContextManager::with_event_sink(config.context_config, config.system_prompt, events);
-        context.record_session_started(workspace_str, policy_name);
+        context.record_session_started(workspace_str, policy_name, Some(fingerprint));
 
         let permission = PermissionEvaluator::new(config.policy);
         let turn_loop = TurnLoop::new(

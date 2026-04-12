@@ -1,5 +1,7 @@
 use crate::context_store::{ContextStore, InMemoryContextStore};
-use crate::session_events::{NullSink, SessionEvent, SessionEventSink, now_millis};
+use crate::session_events::{
+    NullSink, SessionEvent, SessionEventSink, WorkspaceFingerprint, now_millis,
+};
 use kernel_interfaces::provider::ProviderInterface;
 use kernel_interfaces::tool::ToolRegistration;
 use kernel_interfaces::types::{CompletionConfig, Content, Invalidation, Message, Prompt, Role};
@@ -175,13 +177,19 @@ impl ContextManager {
     /// Emit a `SessionStarted` event. Called once after a session is
     /// fully constructed (all policy/workspace details known). Safe on
     /// a `NullSink` — no-op in that case.
-    pub fn record_session_started(&mut self, workspace: String, policy_name: String) {
+    pub fn record_session_started(
+        &mut self,
+        workspace: String,
+        policy_name: String,
+        fingerprint: Option<WorkspaceFingerprint>,
+    ) {
         self.events.record(SessionEvent::SessionStarted {
             timestamp_ms: now_millis(),
             turn_index: self.store.turn_count(),
             workspace,
             system_prompt: self.system_prompt.clone(),
             policy_name,
+            fingerprint,
         });
     }
 
@@ -766,7 +774,7 @@ mod tests {
         let mut cm =
             ContextManager::with_event_sink(test_config(), "System.".into(), Box::new(sink));
 
-        cm.record_session_started("/tmp/workspace".into(), "test-policy".into());
+        cm.record_session_started("/tmp/workspace".into(), "test-policy".into(), None);
         cm.append_user_input("hi".into());
         cm.append_assistant_response("hello".into());
         cm.append_tool_exchange(
