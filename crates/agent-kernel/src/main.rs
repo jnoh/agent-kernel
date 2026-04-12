@@ -589,6 +589,13 @@ fn run_tui_loop(
                             session_id: SessionId(0),
                         });
                     }
+                    tui::SlashCommand::Tools => {
+                        for entry in &mut app.entries {
+                            if let tui::ConversationEntry::ToolCall { expanded, .. } = entry {
+                                *expanded = !*expanded;
+                            }
+                        }
+                    }
                     tui::SlashCommand::Quit => return Ok(()),
                     tui::SlashCommand::Unknown(name) => {
                         app.entries.push(tui::ConversationEntry::Error(format!(
@@ -650,6 +657,7 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
                 input_summary: format_tool_input(tool_name, input),
                 status: tui::ToolCallStatus::Running(std::time::Instant::now()),
                 result_summary: None,
+                expanded: false,
             });
             app.scroll_to_bottom();
         }

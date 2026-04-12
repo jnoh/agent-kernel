@@ -94,6 +94,8 @@ pub enum ConversationEntry {
         status: ToolCallStatus,
         /// Tool result (populated after execution).
         result_summary: Option<String>,
+        /// Whether result details are expanded (toggled by user).
+        expanded: bool,
     },
     /// Permission request awaiting user decision.
     PermissionPrompt {
@@ -418,7 +420,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     for (entry_idx, entry) in app.entries.iter().enumerate() {
         match entry {
             ConversationEntry::UserInput(text) => {
-                // Blank line before user input (conversation separator)
                 if entry_idx > 0 {
                     lines.push(Line::from(""));
                 }
@@ -435,7 +436,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             ConversationEntry::AssistantText(text) => {
-                // Blank line before assistant text
                 lines.push(Line::from(""));
                 lines.extend(markdown_to_lines(text));
             }
@@ -445,75 +445,66 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                 input_summary,
                 status,
                 result_summary,
+                expanded,
             } => {
-                // Format duration string
-                let duration_str = match status {
-                    ToolCallStatus::Success(d) => {
-                        let ms = d.as_millis();
-                        if ms < 1000 {
-                            format!(" ({ms}ms)")
-                        } else {
-                            format!(" ({:.1}s)", d.as_secs_f32())
-                        }
-                    }
-                    _ => String::new(),
-                };
-
-                // Compact single-line view for completed tool calls
                 let is_running = matches!(status, ToolCallStatus::Running(_));
-                let show_result = is_running || matches!(status, ToolCallStatus::Failed(_));
+                let show_box = is_running || *expanded;
 
-                if !show_result {
-                    let (indicator, style) = match status {
-                        ToolCallStatus::Success(_) => {
-                            ("\u{2713}", Style::default().fg(app.theme.tool_success))
-                        }
-                        ToolCallStatus::Failed(_) => {
-                            ("\u{2717}", Style::default().fg(app.theme.tool_failed))
-                        }
-                        _ => ("", Style::default()),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {indicator} "), style),
-                        Span::styled(tool_name.clone(), Style::default().fg(app.theme.info)),
-                        Span::styled(
-                            format!(" {input_summary}"),
-                            Style::default().fg(app.theme.tool_border),
-                        ),
-                        Span::styled(
-                            duration_str.clone(),
-                            Style::default().fg(app.theme.tool_border),
-                        ),
-                    ]));
-                    continue;
-                }
-                let (indicator, style) = match status {
+                // Status indicator + duration
+                let (indicator, ind_style) = match status {
                     ToolCallStatus::Running(start) => {
                         let ch = SPINNER[app.spinner_tick % SPINNER.len()];
                         let elapsed = start.elapsed().as_secs_f32();
-                        let time_str = if elapsed >= 1.0 {
+                        let s = if elapsed >= 1.0 {
                             format!(" {ch} {elapsed:.1}s")
                         } else {
                             format!(" {ch}")
                         };
-                        (time_str, Style::default().fg(app.theme.tool_running))
+                        (s, Style::default().fg(app.theme.tool_running))
                     }
                     ToolCallStatus::Success(d) => {
                         let ms = d.as_millis();
                         let dur = if ms < 1000 {
-                            format!(" \u{2713} ({ms}ms)")
+                            format!("{ms}ms")
                         } else {
-                            format!(" \u{2713} ({:.1}s)", d.as_secs_f32())
+                            format!("{:.1}s", d.as_secs_f32())
                         };
-                        (dur, Style::default().fg(app.theme.tool_success))
+                        (dur, Style::default().fg(app.theme.tool_border))
                     }
-                    ToolCallStatus::Failed(msg) => (
-                        format!(" \u{2717} {msg}"),
-                        Style::default().fg(app.theme.tool_failed),
-                    ),
+                    ToolCallStatus::Failed(msg) => {
+                        (msg.clone(), Style::default().fg(app.theme.tool_failed))
+                    }
                 };
 
-                // Top border
+                let status_icon = match status {
+                    ToolCallStatus::Running(_) => "",
+                    ToolCallStatus::Success(_) => "\u{2713} ",
+                    ToolCallStatus::Failed(_) => "\u{2717} ",
+                };
+                let icon_style = match status {
+                    ToolCallStatus::Running(_) => Style::default(),
+                    ToolCallStatus::Success(_) => Style::default().fg(app.theme.tool_success),
+                    ToolCallStatus::Failed(_) => Style::default().fg(app.theme.tool_failed),
+                };
+
+                if !show_box {
+                    // Compact one-liner for completed tools
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {status_icon}"), icon_style),
+                        Span::styled(
+                            tool_name.clone(),
+                            Style::default().fg(app.theme.tool_border),
+                        ),
+                        Span::styled(
+                            format!(" {input_summary}"),
+                            Style::default().fg(app.theme.tool_border),
+                        ),
+                        Span::styled(format!(" {indicator}"), ind_style),
+                    ]));
+                    continue;
+                }
+
+                // Expanded box for running or user-expanded tools
                 let title = format!("\u{250c}\u{2500} {tool_name} ");
                 let remaining = inner_width.saturating_sub(title.len());
                 let top = format!("{title}{}\u{2510}", "\u{2500}".repeat(remaining));
@@ -537,18 +528,17 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::raw(summary),
-                    Span::styled(indicator, style),
+                    Span::styled(format!(" {status_icon}{indicator}"), ind_style),
                 ]));
 
-                // Result lines (inside the box, truncated)
+                // Result lines
                 if let Some(result) = result_summary {
-                    let max_result_lines = 10;
+                    let max_result_lines = 20;
                     let result_color = match tool_name.as_str() {
                         "file_read" | "grep" => app.theme.code_block,
                         "shell" => Color::White,
                         _ => app.theme.tool_result,
                     };
-                    // Show error results in red
                     let result_color =
                         if result.starts_with("[error]") || result.starts_with("[exit") {
                             app.theme.error
@@ -588,7 +578,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                 }
 
-                // Bottom border
                 let bottom_inner = inner_width.saturating_sub(2);
                 let bottom = format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(bottom_inner));
                 lines.push(Line::from(Span::styled(
@@ -809,12 +798,14 @@ pub enum InputAction {
 /// A parsed slash command from the input bar.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SlashCommand {
-    /// `/clear` — clear the conversation display (no daemon round-trip).
+    /// `/clear` — clear the conversation display.
     Clear,
     /// `/compact` — request context compaction.
     Compact,
     /// `/status` — query session status.
     Status,
+    /// `/tools` — toggle tool result expansion.
+    Tools,
     /// `/quit` or `/exit` — quit the TUI.
     Quit,
     /// Leading `/` but not a recognized command.
@@ -831,6 +822,7 @@ pub fn parse_slash_command(text: &str) -> Option<SlashCommand> {
         "/clear" => SlashCommand::Clear,
         "/compact" => SlashCommand::Compact,
         "/status" => SlashCommand::Status,
+        "/tools" => SlashCommand::Tools,
         "/quit" | "/exit" => SlashCommand::Quit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -1009,7 +1001,6 @@ fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
                 code_block_buf.clear();
             }
             Event::End(TagEnd::CodeBlock) => {
-                // Render code block with background styling
                 for code_line in code_block_buf.lines() {
                     lines.push(Line::from(Span::styled(
                         format!("  {code_line}"),
@@ -1018,7 +1009,6 @@ fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
                 }
                 in_code_block = false;
                 code_block_buf.clear();
-                lines.push(Line::from(""));
             }
 
             Event::Start(Tag::List(_)) => list_depth += 1,
