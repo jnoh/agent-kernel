@@ -17,8 +17,9 @@ use kernel_interfaces::types::{
     Capability, CapabilitySet, Invalidation, RelevanceSignal, TokenEstimate,
 };
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Names of every tool this toolset exposes, in registration order.
 /// Exported so distributions can build prompt text without reaching
@@ -31,6 +32,14 @@ pub const TOOL_NAMES: &[&str] = &[
     "ls",
     "grep",
 ];
+
+/// Which stream a streaming shell chunk belongs to. Public so the MCP
+/// binary can translate it into the wire-level `ToolChunkStream`.
+#[derive(Debug, Clone, Copy)]
+pub enum ShellStream {
+    Stdout,
+    Stderr,
+}
 
 /// A workspace rooted at a local directory. Implements `ToolSet` by
 /// returning the six filesystem/shell tools scoped to that directory.
@@ -285,7 +294,77 @@ pub struct ShellTool {
     workspace: PathBuf,
 }
 
+/// The final result of a streaming shell run, matching the JSON the
+/// non-streaming `execute` path produces.
+pub struct ShellRunResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 impl ShellTool {
+    /// Spawn the command under `sh -c`, stream each stdout/stderr line
+    /// to `on_chunk`, and return the concatenated output plus exit code.
+    ///
+    /// Used by the MCP stdio server (`kernel-workspace-local` binary)
+    /// so the kernel can forward live output as `notifications/progress`.
+    /// The in-process `execute` path below stays line-buffering-free for
+    /// tests that don't care about streaming.
+    pub fn run_streaming<F>(&self, command: &str, mut on_chunk: F) -> Result<ShellRunResult, String>
+    where
+        F: FnMut(ShellStream, &str),
+    {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.workspace)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to spawn shell: {e}"))?;
+
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+
+        // Read stderr on a background thread so we don't deadlock when
+        // the child floods one pipe while we're blocked on the other.
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            buf
+        });
+
+        let mut stdout_buf = String::new();
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            on_chunk(ShellStream::Stdout, &line);
+            stdout_buf.push_str(&line);
+            stdout_buf.push('\n');
+        }
+
+        let stderr_buf = stderr_handle.join().unwrap_or_default();
+        // Emit the collected stderr in one shot after stdout finishes —
+        // a background-emitting stderr thread would need shared state
+        // and the MCP server is single-threaded anyway.
+        if !stderr_buf.is_empty() {
+            for line in stderr_buf.lines() {
+                on_chunk(ShellStream::Stderr, line);
+            }
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("failed to wait on shell: {e}"))?;
+
+        Ok(ShellRunResult {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        })
+    }
+
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             caps: [Capability::new("shell:exec")].into_iter().collect(),

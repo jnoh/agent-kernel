@@ -546,6 +546,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -556,7 +557,6 @@ dependencies = [
  "kernel-core",
  "kernel-interfaces",
  "kernel-providers",
- "kernel-workspace-local",
  "serde",
  "serde_json",
  "serde_yaml",

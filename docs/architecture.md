@@ -569,7 +569,7 @@ pub trait ToolSet: Send + Sync {
 
 The daemon (`kernel-daemon::toolset_pool`) owns a **`ToolsetPool`** at process lifetime,
 built at startup from `[[toolset]]` entries in the distribution manifest. Each entry has
-a `kind` string (e.g. `"workspace.local"`), an optional `id`, and an opaque
+a `kind` string (e.g. `"mcp.stdio"`), an optional `id`, and an opaque
 `[toolset.config]` block. A `FactoryRegistry` maps `kind` → factory function, returning
 `Box<dyn ToolSet>`. `ToolsetPool::build` calls each factory, collects every set's tools
 into a merged `Vec<Arc<dyn ToolRegistration>>`, and fails hard on name collisions across
@@ -582,12 +582,26 @@ tool and, when a tool finishes, emits a `KernelEvent::ToolCompleted` so the fron
 sees the result without any distro-side execution hop.
 
 The one built-in factory registered in `default_registry()` is
-`"workspace.local" → kernel_workspace_local::from_entry`. `kernel-workspace-local` is a
-library crate that hosts the six filesystem tools (`file_read`, `file_write`,
-`file_edit`, `grep`, `glob`, `ls`) moved out of `dist-code-agent`; it depends only on
-`kernel-interfaces`. Spec 0016 will add a second factory, `"mcp.stdio"`, that swaps the
-in-process `LocalWorkspace` transport for a subprocess without touching any trait
-signature — the factory seam is the whole point of doing 0015 before 0016.
+`"mcp.stdio" → kernel_core::mcp_stdio::from_entry`. This factory spawns a subprocess
+(typically the `kernel-workspace-local` binary) and proxies tool calls over newline-delimited
+JSON-RPC 2.0 on the child's stdio, implementing the MCP subset described below. The previous
+`"workspace.local"` in-process factory was removed in spec 0016 — the daemon no longer depends
+on the `kernel-workspace-local` library crate at all. `kernel-workspace-local` remains as a
+standalone binary and library (hosting `file_read`, `file_write`, `file_edit`, `grep`, `glob`,
+`ls`, `shell`) that `dist-code-agent` still references for `TOOL_NAMES`.
+
+**MCP stdio transport (spec 0016).** `McpStdioToolSet` in `kernel-core::mcp_stdio` owns the
+child process, its stdin/stdout pipes, and a cached `tools/list` response. Each tool is
+exposed as an `McpToolHandle` implementing `ToolRegistration`; `execute` serializes a
+`tools/call` JSON-RPC request through a `Mutex`-guarded `McpClient`, reads messages in a
+blocking loop until the matching response arrives, and forwards any `notifications/progress`
+messages (carrying `agent_kernel/chunk` extension data) to `ctx.emit_chunk`. Capabilities are
+inferred from tool names — a known-brittle first-draft hack sufficient for the six first-party
+tools. Process lifecycle is per-daemon: children are spawned once at `ToolsetPool::build` and
+live for the daemon's lifetime; a crashed child (stdout EOF) triggers one synchronous respawn
+attempt on the next `tools/call`. Wire format is newline-delimited JSON (not MCP's
+Content-Length framing) since both ends are first-party; spec-compliant framing will land
+before the kernel talks to real third-party MCP servers.
 
 #### Streaming tool output
 
@@ -597,9 +611,12 @@ want to stream call `ctx.emit_chunk(ToolChunk { stream, data })` where `stream` 
 `ToolChunkStream::{Stdout, Stderr, Text}`; non-streaming tools ignore the argument. The
 turn loop builds a fresh ctx per tool call whose sink forwards to
 `FrontendEvents::on_tool_output_chunk(tool_name, stream, data)` (empty default impl, so
-existing frontends need no changes). No wire-level chunk event is plumbed across the
-socket yet — chunk streaming terminates at the daemon's `FrontendEvents` impl in 0015;
-spec 0016 widens it to the protocol when subprocesses need it.
+existing frontends need no changes). Spec 0016 added the wire-level event
+`KernelEvent::ToolOutputChunk { session_id, tool_name, stream, data }` so chunks cross the
+Unix socket to the distribution. `ProxyFrontend::on_tool_output_chunk` sends this event; the
+TUI appends chunk data to the in-progress `ToolCall` entry's `result_summary`, and the REPL
+handler prints each chunk to stderr with a `[tool]` prefix. The model still sees a single
+complete `tool_result` at call end via `ToolCompleted`.
 
 #### Tool SDK
 
@@ -1005,9 +1022,11 @@ fallback = "echo"              # downgrade to EchoProvider if the env var is mis
 file = "../policies/permissive.yaml"   # path resolved relative to the manifest
 
 [[toolset]]
-kind = "workspace.local"
+kind = "mcp.stdio"
 id = "workspace"
 [toolset.config]
+command = "kernel-workspace-local"
+args = []
 root = "."
 
 [frontend]
@@ -1018,7 +1037,7 @@ The `DistributionManifest` type and its section structs (`ProviderConfig`, `Poli
 
 **What works today vs the full vision:**
 - Provider, policy file, toolset entries, and frontend kind are all manifest-driven.
-- The one factory registered in `default_registry()` is `"workspace.local"`, backed by the `kernel-workspace-local` library crate (six filesystem tools). Spec 0016 adds an `"mcp.stdio"` factory for subprocess-hosted toolsets without changing any kernel trait signatures.
+- The one factory registered in `default_registry()` is `"mcp.stdio"`, backed by `kernel_core::mcp_stdio::from_entry`, which spawns a subprocess and proxies tool calls over JSON-RPC (see §4.2.1). The daemon no longer depends on `kernel-workspace-local` directly.
 - Frontends are still compile-time: `FrontendKind::Tui` and `FrontendKind::Repl` both live inside `dist-code-agent`. A `frontend-tui` / `frontend-repl` split and headless variants are future work.
 - `[skills]` is not parsed.
 - There is no `agent-kernel install` subcommand; deployment is "run the daemon with `--distro`, run the distro binary with `--distro`." CLI-level overrides (`--policy`, `--frontend`, `--tool-catalog`) are not implemented — the `--repl` flag on `dist-code-agent` still works but prints a deprecation warning pointing at `[frontend] type = "repl"`.
@@ -1059,7 +1078,7 @@ There is no separate `agent-kernel.toml` — the distribution manifest (§7) is 
 | `[distribution]` | both | Name + version string, printed at startup for operator visibility. |
 | `[provider]` | `kernel-daemon` | Selects `AnthropicProvider` / `EchoProvider`, reads the API key from `api_key_env`, optionally falls back to `echo` when the env var is missing. |
 | `[policy]` | `dist-code-agent` | `file = "..."` points at a YAML policy file; the path is resolved relative to the manifest's directory. |
-| `[[toolset]]` | `kernel-daemon` | Each entry has a `kind` (dispatched against `default_registry()`), an optional `id`, and an opaque `[toolset.config]` block. `ToolsetPool::build` constructs each set at startup; the merged tool list is snapshotted into every new session. |
+| `[[toolset]]` | `kernel-daemon` | Each entry has a `kind` (dispatched against `default_registry()`), an optional `id`, and an opaque `[toolset.config]` block. For `kind = "mcp.stdio"`, the config must include `command` (binary name, resolved via `$PATH`) and optionally `args`. `ToolsetPool::build` constructs each set at startup; the merged tool list is snapshotted into every new session. |
 | `[frontend]` | `dist-code-agent` | `type = "tui"` or `type = "repl"`. Overrides the deprecated `--repl` CLI flag. |
 
 Kernel-level tuning (context window, compaction threshold, token budgets) and channel/skill config are not yet exposed in the manifest — those values live in Rust today and will grow new sections as the relevant subsystems mature. See `distros/code-agent.toml` for the current concrete example.

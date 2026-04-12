@@ -12,9 +12,11 @@ fallback = "echo"
 file = "../policies/permissive.yaml"
 
 [[toolset]]
-kind = "workspace.local"
+kind = "mcp.stdio"
 id = "workspace"
 [toolset.config]
+command = "kernel-workspace-local"
+args = []
 root = "."
 
 [frontend]

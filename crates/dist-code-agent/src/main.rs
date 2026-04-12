@@ -703,6 +703,31 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             app.scroll_to_bottom();
         }
 
+        KernelEvent::ToolOutputChunk {
+            tool_name, data, ..
+        } => {
+            // Live chunk from a streaming tool (spec 0016). Append the
+            // data to the most recent in-progress ToolCall entry for
+            // this tool so the user can watch output accumulate.
+            // Dedicated streaming UI is spec 0017+ territory.
+            for entry in app.entries.iter_mut().rev() {
+                if let tui::ConversationEntry::ToolCall {
+                    tool_name: n,
+                    status,
+                    result_summary,
+                    ..
+                } = entry
+                    && n == tool_name
+                    && matches!(status, tui::ToolCallStatus::Running(_))
+                {
+                    let existing = result_summary.take().unwrap_or_default();
+                    *result_summary = Some(format!("{existing}{data}"));
+                    break;
+                }
+            }
+            app.scroll_to_bottom();
+        }
+
         KernelEvent::ToolCompleted {
             tool_name, result, ..
         } => {
@@ -845,6 +870,12 @@ fn run_repl(
                 } => {
                     let display = format_tool_result(&tool_name, &result);
                     eprintln!("  [result] {tool_name} -> {display}");
+                }
+
+                KernelEvent::ToolOutputChunk {
+                    tool_name, data, ..
+                } => {
+                    eprintln!("  [tool] {tool_name}: {}", data.trim_end());
                 }
 
                 KernelEvent::PermissionRequired {

@@ -10,6 +10,12 @@
 //! immutable per-session snapshot. `tools_for_session()` returns a freshly
 //! boxed copy for the session's `EventLoopConfig`. Name collisions across
 //! toolsets are a hard startup error.
+//!
+//! Spec 0016 replaces the in-process `workspace.local` kind with
+//! `mcp.stdio`, whose factory spawns a subprocess (typically
+//! `kernel-workspace-local`) and proxies tool calls across JSON-RPC.
+//! The daemon no longer depends on the workspace-local library crate
+//! at all — the tool implementations are loaded via subprocess.
 
 use kernel_interfaces::manifest::ToolsetEntry;
 use kernel_interfaces::tool::ToolRegistration;
@@ -24,15 +30,15 @@ pub type ToolsetFactory = fn(&ToolsetEntry) -> Result<Box<dyn ToolSet>, String>;
 /// daemon passes an instance of this into `ToolsetPool::build`.
 pub type FactoryRegistry = HashMap<&'static str, ToolsetFactory>;
 
-/// The built-in factory registry for the daemon. Spec 0015 registers one
-/// kind: `workspace.local`, backed by the `kernel-workspace-local` library
-/// crate. More kinds slot in alongside this without touching any existing
-/// kernel code.
+/// The built-in factory registry for the daemon. Spec 0016 registers
+/// one kind: `mcp.stdio`, backed by `kernel_core::mcp_stdio::from_entry`,
+/// which spawns a subprocess and proxies tool calls across JSON-RPC.
+/// More kinds slot in alongside this without touching existing code.
 pub fn default_registry() -> FactoryRegistry {
     let mut m: FactoryRegistry = HashMap::new();
     m.insert(
-        "workspace.local",
-        kernel_workspace_local::from_entry as ToolsetFactory,
+        "mcp.stdio",
+        kernel_core::mcp_stdio::from_entry as ToolsetFactory,
     );
     m
 }
@@ -231,24 +237,28 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_has_workspace_local() {
+    fn default_registry_has_mcp_stdio() {
         let reg = default_registry();
-        assert!(reg.contains_key("workspace.local"));
+        assert!(reg.contains_key("mcp.stdio"));
+        assert!(!reg.contains_key("workspace.local"));
     }
 
     #[test]
-    fn pool_with_workspace_local_produces_tools() {
+    fn mcp_stdio_entry_without_command_is_rejected() {
+        // The mcp.stdio factory needs `command` in config; without it
+        // the factory returns Err and ToolsetPool::build surfaces that
+        // as a hard startup error. Building an entry with no command
+        // lets us verify the wiring without actually spawning anything.
         let reg = default_registry();
         let entry = ToolsetEntry {
-            kind: "workspace.local".into(),
+            kind: "mcp.stdio".into(),
             id: Some("ws".into()),
             config: toml::Value::Table(Default::default()),
         };
-        let pool = ToolsetPool::build(&[entry], &reg).expect("build");
-        let tools = pool.tools_for_session();
-        assert!(!tools.is_empty());
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"file_read"));
-        assert!(names.contains(&"shell"));
+        let err = match ToolsetPool::build(&[entry], &reg) {
+            Ok(_) => panic!("expected mcp.stdio without command to fail"),
+            Err(e) => e,
+        };
+        assert!(err.contains("command"), "err was {err}");
     }
 }

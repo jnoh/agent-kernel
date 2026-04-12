@@ -9,7 +9,7 @@ use kernel_interfaces::frontend::{
     CompactionSummary, FrontendEvents, KernelError, PermissionRequest,
 };
 use kernel_interfaces::protocol::{KernelEvent, RequestId};
-use kernel_interfaces::tool::ToolOutput;
+use kernel_interfaces::tool::{ToolChunkStream, ToolOutput};
 use kernel_interfaces::types::{Decision, SessionId, StreamChunk, TurnId};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,6 +85,15 @@ impl FrontendEvents for ProxyFrontend {
             session_id: self.session_id,
             tool_name: tool_name.to_string(),
             input: input.clone(),
+        });
+    }
+
+    fn on_tool_output_chunk(&self, tool_name: &str, stream: ToolChunkStream, data: &str) {
+        self.send(KernelEvent::ToolOutputChunk {
+            session_id: self.session_id,
+            tool_name: tool_name.to_string(),
+            stream,
+            data: data.to_string(),
         });
     }
 

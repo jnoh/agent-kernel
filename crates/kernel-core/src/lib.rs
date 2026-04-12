@@ -1,6 +1,7 @@
 pub mod context;
 pub mod context_store;
 pub mod event_loop;
+pub mod mcp_stdio;
 pub mod permission;
 pub mod proxy_frontend;
 pub mod session;

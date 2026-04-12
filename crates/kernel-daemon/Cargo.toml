@@ -11,7 +11,6 @@ path = "src/main.rs"
 kernel-interfaces = { path = "../kernel-interfaces" }
 kernel-core = { path = "../kernel-core" }
 kernel-providers = { path = "../kernel-providers" }
-kernel-workspace-local = { path = "../kernel-workspace-local" }
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

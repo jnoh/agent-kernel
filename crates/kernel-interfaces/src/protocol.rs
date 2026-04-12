@@ -11,6 +11,7 @@
 use crate::channel::ExternalEvent;
 use crate::frontend::{CompactionSummary, KernelError, PermissionRequest};
 use crate::policy::Policy;
+use crate::tool::ToolChunkStream;
 use crate::types::{CompletionConfig, Decision, ResourceBudget, SessionId, SessionMode, TurnId};
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +124,17 @@ pub enum KernelEvent {
         session_id: SessionId,
         tool_name: String,
         result: serde_json::Value,
+    },
+
+    /// Incremental output chunk from a still-running tool. Emitted by
+    /// streaming toolsets (e.g. MCP stdio shell) while `tools/call` is
+    /// in flight. Frontends render this as live progress; the model
+    /// still sees a single `tool_result` at call end via `ToolCompleted`.
+    ToolOutputChunk {
+        session_id: SessionId,
+        tool_name: String,
+        stream: ToolChunkStream,
+        data: String,
     },
 
     /// A turn started.
@@ -238,6 +250,18 @@ mod tests {
                 session_id: SessionId(0),
                 tool_name: "file_read".into(),
                 result: serde_json::json!({"content": "fn main() {}"}),
+            },
+            KernelEvent::ToolOutputChunk {
+                session_id: SessionId(0),
+                tool_name: "shell".into(),
+                stream: crate::tool::ToolChunkStream::Stdout,
+                data: "line of output\n".into(),
+            },
+            KernelEvent::ToolOutputChunk {
+                session_id: SessionId(0),
+                tool_name: "shell".into(),
+                stream: crate::tool::ToolChunkStream::Stderr,
+                data: "oops\n".into(),
             },
             KernelEvent::TurnStarted {
                 session_id: SessionId(0),

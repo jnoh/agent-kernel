@@ -1,6 +1,6 @@
 ---
 id: 0016-mcp-stdio-transport
-status: draft
+status: done
 ---
 
 # MCP stdio transport + streaming chunks (the transport half)
@@ -311,4 +311,51 @@ Standing directive: skip checkpoints, execute to completion. Doc-sync
 
 ## Notes
 
-Empty at draft time.
+### Binary discovery
+
+The `kernel-workspace-local` binary is found via `std::process::Command::new`,
+which searches `$PATH`. Two options for local development:
+
+1. **Install into `~/.cargo/bin`:**
+   ```sh
+   cargo install --path crates/kernel-workspace-local
+   ```
+2. **Prepend the target directory to `$PATH`:**
+   ```sh
+   export PATH="$(pwd)/target/debug:$PATH"
+   cargo run -p kernel-daemon -- --distro distros/code-agent.toml
+   ```
+
+### Design notes
+
+- **Newline-delimited JSON-RPC** instead of Content-Length framing. Both
+  ends are first-party; upgrade to spec-compliant framing will land before
+  we talk to real third-party MCP servers.
+
+- **`dead` flag is a plain `bool`** guarded by the existing `Mutex`
+  rather than an `AtomicBool`. The initial spec draft called for AtomicBool,
+  but since every access goes through the Mutex anyway, the atomic adds
+  no value and a raw bool is simpler.
+
+- **Capability inference** from tool names (`infer_capabilities`) is a
+  known-brittle first-draft hack. It works for the six first-party tools
+  but will need a schema-level convention in a follow-up spec (0017+).
+
+- **`toml_to_json` helper** in `kernel-core::mcp_stdio`: needed because
+  manifest config arrives as `toml::Value` and the subprocess expects
+  JSON under `params.agent_kernel`. This added `toml = "0.8"` to
+  kernel-core's deps — acceptable since kernel-core already depends on
+  serde and the toml crate is already in the workspace lockfile.
+
+- **`shutdown`/`exit` method handling** in the MCP binary: while not in
+  the minimal MCP subset, these are essential for clean subprocess
+  teardown and testing (the integration tests rely on process exit).
+
+- **Parse error (`-32700`) and "not initialized" (`-32002`) responses** in
+  the MCP binary are standard JSON-RPC 2.0 error codes. Without them,
+  protocol violations silently pass — adding them is defensive correctness.
+
+- **Newline normalization on chunks**: the client appends `\n` to chunk
+  data that doesn't already end with one. This keeps the buffered-chunk
+  result (used when `content` is empty) readable and prevents consecutive
+  chunks from running together.

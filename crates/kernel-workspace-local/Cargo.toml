@@ -3,6 +3,10 @@ name = "kernel-workspace-local"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "kernel-workspace-local"
+path = "src/main.rs"
+
 [dependencies]
 kernel-interfaces = { path = "../kernel-interfaces" }
 serde = { version = "1", features = ["derive"] }
