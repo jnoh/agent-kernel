@@ -6,7 +6,10 @@
 
 use crossterm::{
     ExecutableCommand,
-    event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
+        MouseEventKind,
+    },
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
@@ -768,11 +771,13 @@ fn cursor_position_in_input(input: &str, cursor: usize) -> (usize, usize) {
 pub fn init_terminal() -> io::Result<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     Terminal::new(backend)
 }
 
 pub fn restore_terminal() {
+    let _ = io::stdout().execute(DisableMouseCapture);
     let _ = terminal::disable_raw_mode();
     let _ = io::stdout().execute(LeaveAlternateScreen);
 }
