@@ -1,5 +1,5 @@
 [package]
-name = "dist-code-agent"
+name = "agent-kernel"
 version.workspace = true
 edition.workspace = true
 
@@ -9,15 +9,18 @@ path = "src/main.rs"
 
 [dependencies]
 kernel-interfaces = { path = "../kernel-interfaces" }
+kernel-core = { path = "../kernel-core" }
+kernel-providers = { path = "../kernel-providers" }
 kernel-workspace-local = { path = "../kernel-workspace-local" }
+crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+toml = "0.8"
 ratatui = "0.29"
 crossterm = "0.28"
 pulldown-cmark = "0.13"
 unicode-width = "0.1"
 
 [dev-dependencies]
-kernel-core = { path = "../kernel-core" }
 tempfile = "3"

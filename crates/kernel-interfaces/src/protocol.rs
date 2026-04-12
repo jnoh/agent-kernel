@@ -1,12 +1,12 @@
-//! Protocol message types for kernel ↔ distro IPC.
+//! Protocol message types for kernel ↔ frontend communication.
 //!
-//! The kernel daemon and distro processes communicate via length-prefixed JSON
-//! messages over a Unix domain socket. This module defines all message types.
+//! These enums flow over crossbeam channels between the session thread
+//! (EventLoop) and the frontend thread (TUI/REPL/WebSocket). Originally
+//! serialized over a Unix socket; as of spec 0017 they're in-process
+//! channel messages.
 //!
-//! As of spec 0015, tool dispatch is entirely kernel-side — the distro does
-//! not register tools, does not execute tools, and never sees tool I/O on
-//! this protocol. Tools live in `[[toolset]]` entries in the distribution
-//! manifest and are owned by the daemon's `ToolsetPool`.
+//! Tool dispatch is entirely kernel-side — the frontend does not register
+//! tools, execute tools, or see tool I/O except via these events.
 
 use crate::channel::ExternalEvent;
 use crate::frontend::{CompactionSummary, KernelError, PermissionRequest};
@@ -47,7 +47,7 @@ pub struct TurnResultSummary {
 // Messages: Distro → Kernel
 // ---------------------------------------------------------------------------
 
-/// Messages sent from the distro to the kernel daemon.
+/// Messages sent from the frontend to the session thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KernelRequest {
     /// Create a new session with the given configuration.
@@ -83,7 +83,7 @@ pub enum KernelRequest {
     /// Query session status (tokens, utilization, turn count).
     QuerySession { session_id: SessionId },
 
-    /// Shut down the kernel daemon.
+    /// Shut down the session.
     Shutdown,
 }
 
@@ -91,7 +91,7 @@ pub enum KernelRequest {
 // Messages: Kernel → Distro
 // ---------------------------------------------------------------------------
 
-/// Messages sent from the kernel daemon to the distro.
+/// Messages sent from the session thread to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KernelEvent {
     /// A new session was created.

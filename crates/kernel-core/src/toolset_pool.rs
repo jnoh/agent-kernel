@@ -1,21 +1,15 @@
-//! Daemon-side toolset pool.
+//! Toolset pool — builds and caches `ToolSet` instances from manifest
+//! `[[toolset]]` entries at startup.
 //!
-//! Builds a set of `ToolSet` instances at daemon startup, one per
-//! `[[toolset]]` entry in the distribution manifest. Each entry's `kind`
-//! is routed through a factory registry to a constructor function; the
-//! entry's opaque `config` table is handed through. Spec 0015 registers
-//! exactly one factory: `workspace.local → kernel_workspace_local::from_entry`.
+//! Each entry's `kind` is routed through a factory registry to a
+//! constructor function; the entry's opaque `config` table is handed
+//! through. The pool holds each toolset's discovered tools as an
+//! immutable snapshot. `tools_for_session()` returns a freshly boxed
+//! copy for a session's tool list. Name collisions across toolsets are
+//! a hard startup error.
 //!
-//! After build, the pool holds each toolset's discovered tools as an
-//! immutable per-session snapshot. `tools_for_session()` returns a freshly
-//! boxed copy for the session's `EventLoopConfig`. Name collisions across
-//! toolsets are a hard startup error.
-//!
-//! Spec 0016 replaces the in-process `workspace.local` kind with
-//! `mcp.stdio`, whose factory spawns a subprocess (typically
-//! `kernel-workspace-local`) and proxies tool calls across JSON-RPC.
-//! The daemon no longer depends on the workspace-local library crate
-//! at all — the tool implementations are loaded via subprocess.
+//! The default registry registers `mcp.stdio`, whose factory spawns a
+//! subprocess and proxies tool calls across JSON-RPC (spec 0016).
 
 use kernel_interfaces::manifest::ToolsetEntry;
 use kernel_interfaces::tool::ToolRegistration;
@@ -30,16 +24,13 @@ pub type ToolsetFactory = fn(&ToolsetEntry) -> Result<Box<dyn ToolSet>, String>;
 /// daemon passes an instance of this into `ToolsetPool::build`.
 pub type FactoryRegistry = HashMap<&'static str, ToolsetFactory>;
 
-/// The built-in factory registry for the daemon. Spec 0016 registers
-/// one kind: `mcp.stdio`, backed by `kernel_core::mcp_stdio::from_entry`,
-/// which spawns a subprocess and proxies tool calls across JSON-RPC.
-/// More kinds slot in alongside this without touching existing code.
+/// The built-in factory registry. Registers `mcp.stdio`, backed by
+/// `mcp_stdio::from_entry`, which spawns a subprocess and proxies tool
+/// calls across JSON-RPC. More kinds slot in alongside this without
+/// touching existing code.
 pub fn default_registry() -> FactoryRegistry {
     let mut m: FactoryRegistry = HashMap::new();
-    m.insert(
-        "mcp.stdio",
-        kernel_core::mcp_stdio::from_entry as ToolsetFactory,
-    );
+    m.insert("mcp.stdio", crate::mcp_stdio::from_entry as ToolsetFactory);
     m
 }
 

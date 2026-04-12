@@ -7,4 +7,5 @@ pub mod proxy_frontend;
 pub mod session;
 pub mod session_events;
 pub mod testutil;
+pub mod toolset_pool;
 pub mod turn_loop;

@@ -1,5 +1,4 @@
 pub mod channel;
-pub mod framing;
 pub mod frontend;
 pub mod manifest;
 pub mod policy;

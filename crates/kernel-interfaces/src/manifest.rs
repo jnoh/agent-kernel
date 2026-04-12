@@ -1,14 +1,11 @@
-//! Distribution manifest — the TOML file that tells the kernel which
-//! provider, policy, tools, and frontend to run. Read by both the
-//! daemon (for provider) and `dist-code-agent` (for policy, tools,
-//! frontend).
+//! Distribution manifest — the TOML file that tells `agent-kernel` which
+//! provider, policy, tools, and frontend to run.
 //!
 //! The types in this file are pure data — the runtime construction
 //! (e.g., turning `ProviderConfig::Anthropic` into an `AnthropicProvider`)
-//! happens in whichever crate owns the concrete impl (`kernel-providers`
-//! via `kernel-daemon`, etc.). That's why this module lives here on
-//! the stable API side: distributions implementing their own providers
-//! or tools need the shared file format, not the first-party impls.
+//! happens in the binary crate. This module lives here on the stable
+//! API side so that distributions implementing their own providers or
+//! tools can share the file format.
 //!
 //! File format (v0.2, extended by spec 0012):
 //!

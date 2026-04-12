@@ -15,7 +15,7 @@ Current state: ratatui TUI with markdown rendering, input history, multiline inp
 - Progress for long-running tools (elapsed time next to spinner)
 - Token budget indicator and timestamps
 - Color theme struct
-- Daemon reconnection support
+- ~~Daemon reconnection support~~ (removed: daemon collapsed into single binary in spec 0017)
 - Duplicate tool call fix
 - Slash commands (`/clear`, `/compact`, `/status`, `/quit`)
 - Permission "always allow" (`a` key during prompt)

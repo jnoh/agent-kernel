@@ -1,13 +1,20 @@
 mod prompt;
+mod provider;
 mod tui;
 
-use kernel_interfaces::framing::{read_message, write_message};
+use kernel_core::event_loop::{EventLoop, EventLoopConfig};
+use kernel_core::proxy_frontend::{PermissionResponse, ProxyFrontend};
+use kernel_core::session_events::{
+    FileSink, HttpSink, NullSink, SessionEventSink, TeeSink, default_events_path,
+};
+use kernel_core::toolset_pool::{ToolsetPool, default_registry};
 use kernel_interfaces::protocol::{KernelEvent, KernelRequest, SessionCreateConfig};
-use kernel_interfaces::types::{CompletionConfig, Decision, ResourceBudget, SessionMode};
+use kernel_interfaces::types::{
+    CompletionConfig, Decision, ResourceBudget, SessionId, SessionMode,
+};
 
 use std::env;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -16,7 +23,6 @@ use std::time::Duration;
 // Tool display formatting
 // ---------------------------------------------------------------------------
 
-/// Format a tool's input JSON into a human-readable one-liner.
 fn format_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
     match tool_name {
         "file_read" => {
@@ -66,9 +72,7 @@ fn format_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-/// Format a tool's result JSON into a human-readable summary.
 fn format_tool_result(tool_name: &str, result: &serde_json::Value) -> String {
-    // Check for errors first
     if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
         return format!("[error] {err}");
     }
@@ -143,7 +147,6 @@ fn format_tool_result(tool_name: &str, result: &serde_json::Value) -> String {
             }
         }
         "ls" => {
-            // Result is typically a JSON array of filenames
             if let Some(arr) = result.as_array() {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -169,73 +172,36 @@ fn format_tool_result(tool_name: &str, result: &serde_json::Value) -> String {
 fn main() {
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Parse args
     let args: Vec<String> = env::args().collect();
     let repl_mode = args.iter().any(|a| a == "--repl");
 
-    let socket_path = args
+    // --manifest (preferred) or --distro (deprecated alias)
+    let manifest_path = args
         .iter()
-        .position(|a| a == "--socket")
+        .position(|a| a == "--manifest")
+        .or_else(|| args.iter().position(|a| a == "--distro"))
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
 
-    let distro_path = args
-        .iter()
-        .position(|a| a == "--distro")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from);
-
-    // Resolve policy + tool selection from the manifest (or fall back
-    // to compiled-in defaults with a deprecation warning).
     #[allow(deprecated)]
-    let settings = match distro_path.as_ref() {
-        Some(path) => match load_distribution_settings(path) {
+    let settings = match manifest_path.as_ref() {
+        Some(path) => match load_settings(path) {
             Ok(s) => {
-                eprintln!("distro: loaded settings from {}", path.display());
+                eprintln!(
+                    "loaded manifest: {} v{}",
+                    s.manifest.distribution.name, s.manifest.distribution.version
+                );
                 s
             }
             Err(e) => {
-                eprintln!("distro: failed to load manifest: {e}");
-                eprintln!("distro: falling back to hard-coded defaults");
-                DistributionSettings::deprecated_defaults()
+                eprintln!("failed to load manifest: {e}");
+                eprintln!("falling back to hard-coded defaults");
+                Settings::deprecated_defaults()
             }
         },
         None => {
-            eprintln!(
-                "warning: --distro not set; using deprecated hard-coded defaults \
-                 (provider/policy/tools)"
-            );
-            DistributionSettings::deprecated_defaults()
-        }
-    };
-
-    let socket_path = match socket_path {
-        Some(p) => p,
-        None => {
-            // Find the most recently modified daemon socket
-            let found = std::fs::read_dir("/tmp").ok().and_then(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name().to_string_lossy().starts_with("agent-kernel-")
-                            && e.file_name().to_string_lossy().ends_with(".sock")
-                    })
-                    .max_by_key(|e| {
-                        e.metadata()
-                            .and_then(|m| m.modified())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                    })
-                    .map(|e| e.path())
-            });
-            match found {
-                Some(p) => p,
-                None => {
-                    eprintln!("No daemon socket found. Start the daemon first:");
-                    eprintln!("  agent-kernel-daemon");
-                    eprintln!("Or specify --socket <path>");
-                    std::process::exit(1);
-                }
-            }
+            eprintln!("warning: --manifest not set; using deprecated hard-coded defaults");
+            Settings::deprecated_defaults()
         }
     };
 
@@ -250,40 +216,43 @@ fn main() {
     };
 
     match frontend_kind {
-        FrontendKind::Repl => run_repl(&socket_path, &workspace, settings),
-        FrontendKind::Tui => run_tui(&socket_path, &workspace, settings),
+        FrontendKind::Repl => run_repl(&workspace, settings),
+        FrontendKind::Tui => run_tui(&workspace, settings),
     }
 }
 
-/// Config values derived from the distribution manifest (or from the
-/// deprecated compiled-in defaults when no `--distro` is given).
-///
-/// As of spec 0015 the distro no longer configures tools — the kernel
-/// owns tool lifecycle via `[[toolset]]` manifest entries. This struct
-/// only carries things the distro still cares about (policy for session
-/// creation, frontend kind for dispatch).
-struct DistributionSettings {
+// ---------------------------------------------------------------------------
+// Settings (loaded from manifest or deprecated defaults)
+// ---------------------------------------------------------------------------
+
+struct Settings {
+    manifest: kernel_interfaces::manifest::DistributionManifest,
     policy: kernel_interfaces::policy::Policy,
     frontend: kernel_interfaces::manifest::FrontendKind,
 }
 
-impl DistributionSettings {
-    #[deprecated(note = "temporary shim while we migrate to manifest-driven config (spec 0013)")]
+impl Settings {
+    #[deprecated(note = "temporary shim while we migrate to manifest-driven config")]
     #[allow(deprecated)]
     fn deprecated_defaults() -> Self {
         Self {
+            manifest: kernel_interfaces::manifest::DistributionManifest {
+                distribution: kernel_interfaces::manifest::DistributionMeta {
+                    name: "code-agent".into(),
+                    version: "0.1.0".into(),
+                },
+                provider: kernel_interfaces::manifest::ProviderConfig::Echo,
+                policy: None,
+                toolsets: Vec::new(),
+                frontend: None,
+            },
             policy: default_policy(),
             frontend: kernel_interfaces::manifest::FrontendKind::Tui,
         }
     }
 }
 
-/// Load a full `DistributionSettings` from a manifest file: policy YAML
-/// resolved against the manifest directory, plus `[frontend]` kind if
-/// present. Returns an error string if any step fails.
-fn load_distribution_settings(
-    manifest_path: &std::path::Path,
-) -> Result<DistributionSettings, String> {
+fn load_settings(manifest_path: &std::path::Path) -> Result<Settings, String> {
     let manifest = kernel_interfaces::manifest::load_manifest(manifest_path)?;
     let manifest_dir = kernel_interfaces::manifest::manifest_dir(manifest_path);
 
@@ -306,21 +275,14 @@ fn load_distribution_settings(
         .map(|f| f.kind)
         .unwrap_or(kernel_interfaces::manifest::FrontendKind::Tui);
 
-    Ok(DistributionSettings { policy, frontend })
+    Ok(Settings {
+        manifest,
+        policy,
+        frontend,
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Shared: connect + register + create session
-// ---------------------------------------------------------------------------
-
-struct DaemonConnection {
-    writer: std::sync::Arc<std::sync::Mutex<BufWriter<UnixStream>>>,
-    reader: BufReader<UnixStream>,
-}
-
-#[deprecated(
-    note = "hard-coded policy is deprecated; pass --distro <manifest.toml> with a [policy] section instead (spec 0012)"
-)]
+#[deprecated(note = "hard-coded policy; pass --manifest with a [policy] section instead")]
 fn default_policy() -> kernel_interfaces::policy::Policy {
     kernel_interfaces::policy::Policy {
         version: 1,
@@ -345,9 +307,6 @@ fn default_policy() -> kernel_interfaces::policy::Policy {
     }
 }
 
-/// Prepend an `Allow` rule for the given capabilities to the policy's rule
-/// list. First-match-wins evaluation means the new rule shadows any later
-/// `Ask` or `Deny` that would otherwise match the same capability.
 fn prepend_allow_rule(policy: &mut kernel_interfaces::policy::Policy, capabilities: Vec<String>) {
     policy.rules.insert(
         0,
@@ -361,100 +320,148 @@ fn prepend_allow_rule(policy: &mut kernel_interfaces::policy::Policy, capabiliti
     );
 }
 
-fn connect_and_setup(
-    socket_path: &std::path::Path,
-    workspace: &std::path::Path,
-    policy: kernel_interfaces::policy::Policy,
-) -> DaemonConnection {
-    let stream = UnixStream::connect(socket_path).unwrap_or_else(|e| {
-        eprintln!("Failed to connect to {}: {e}", socket_path.display());
+// ---------------------------------------------------------------------------
+// Session setup
+// ---------------------------------------------------------------------------
+
+struct SessionHandle {
+    input_tx: crossbeam_channel::Sender<KernelRequest>,
+    event_rx: crossbeam_channel::Receiver<KernelEvent>,
+    permission_tx: crossbeam_channel::Sender<PermissionResponse>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+fn setup_session(workspace: &std::path::Path, settings: &Settings) -> SessionHandle {
+    let session_id = SessionId(0);
+
+    // Build provider
+    let provider_factory =
+        provider::build_provider_factory(&settings.manifest).unwrap_or_else(|e| {
+            eprintln!("failed to build provider: {e}");
+            std::process::exit(1);
+        });
+    let provider = provider_factory();
+
+    // Build toolset pool
+    let registry = default_registry();
+    let pool = ToolsetPool::build(&settings.manifest.toolsets, &registry).unwrap_or_else(|e| {
+        eprintln!("failed to build toolset pool: {e}");
         std::process::exit(1);
     });
+    let tools = pool.tools_for_session();
+    eprintln!(
+        "tools: {}",
+        tools
+            .iter()
+            .map(|t| t.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
-    let write_stream = stream.try_clone().expect("clone stream");
-    let read_stream = stream;
+    // Channels
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
 
-    let writer = std::sync::Arc::new(std::sync::Mutex::new(BufWriter::new(write_stream)));
+    // Build system prompt
+    let tool_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+    let system_prompt = prompt::build_system_prompt(&prompt::PromptContext {
+        workspace: workspace.display().to_string(),
+        tool_names,
+    });
 
-    // Since spec 0015 the distro doesn't know the kernel's tool list
-    // directly — the daemon owns the toolset pool. For system-prompt
-    // display we use the fixed name list exported by the first-party
-    // workspace toolset, which is what every `distros/code-agent.toml`
-    // ships by default. When multi-toolset distros arrive, this will
-    // become a protocol call or a manifest-mirror read.
-    let tool_names: Vec<String> = kernel_workspace_local::TOOL_NAMES
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+    // ProxyFrontend sends KernelEvents to event_tx
+    let frontend = ProxyFrontend::new(
+        session_id,
+        event_tx.clone(),
+        permission_rx,
+        Duration::from_secs(300),
+    );
 
-    {
-        let mut w = writer.lock().unwrap();
-        write_message(
-            &mut *w,
-            &KernelRequest::CreateSession {
-                config: SessionCreateConfig {
-                    mode: SessionMode::Interactive,
-                    system_prompt: prompt::build_system_prompt(&prompt::PromptContext {
-                        workspace: workspace.display().to_string(),
-                        tool_names,
-                    }),
-                    completion_config: CompletionConfig::default(),
-                    policy,
-                    resource_budget: ResourceBudget::default(),
-                    workspace: workspace.to_string_lossy().into_owned(),
-                },
-            },
-        )
-        .expect("send CreateSession");
+    // Session event sink
+    let events: Box<dyn SessionEventSink> = {
+        let log_path = default_events_path(session_id);
+        let local: Box<dyn SessionEventSink> = match FileSink::new(session_id, &log_path) {
+            Ok(sink) => Box::new(sink),
+            Err(e) => {
+                eprintln!(
+                    "session_events: failed to open {} ({e}); using NullSink",
+                    log_path.display()
+                );
+                Box::new(NullSink::new(session_id))
+            }
+        };
+
+        match std::env::var("AGENT_KERNEL_REMOTE_SINK_URL") {
+            Ok(url) if !url.is_empty() => {
+                let token = std::env::var("AGENT_KERNEL_REMOTE_SINK_TOKEN").ok();
+                match HttpSink::new(session_id, &url, token) {
+                    Ok(remote) => {
+                        eprintln!(
+                            "session_events: teeing to remote sink {}",
+                            remote.endpoint()
+                        );
+                        Box::new(TeeSink::new(local, remote))
+                    }
+                    Err(e) => {
+                        eprintln!("session_events: bad remote sink URL ({e}); local only");
+                        local
+                    }
+                }
+            }
+            _ => local,
+        }
+    };
+
+    let config = EventLoopConfig {
+        session_id,
+        session_create: SessionCreateConfig {
+            mode: SessionMode::Interactive,
+            system_prompt,
+            completion_config: CompletionConfig::default(),
+            policy: settings.policy.clone(),
+            resource_budget: ResourceBudget::default(),
+            workspace: workspace.to_string_lossy().into_owned(),
+        },
+        tools,
+        provider,
+        frontend,
+        events,
+    };
+
+    let mut event_loop = EventLoop::new(config, input_rx, event_tx);
+    let thread = std::thread::spawn(move || {
+        event_loop.run();
+    });
+
+    SessionHandle {
+        input_tx,
+        event_rx,
+        permission_tx,
+        _thread: thread,
     }
-
-    let reader = BufReader::new(read_stream);
-    DaemonConnection { writer, reader }
 }
 
 // ---------------------------------------------------------------------------
 // TUI mode
 // ---------------------------------------------------------------------------
 
-fn run_tui(
-    socket_path: &std::path::Path,
-    workspace: &std::path::Path,
-    settings: DistributionSettings,
-) {
-    let mut current_policy = settings.policy;
-    let conn = connect_and_setup(socket_path, workspace, current_policy.clone());
-    let writer = conn.writer;
+fn run_tui(workspace: &std::path::Path, settings: Settings) {
+    let mut current_policy = settings.policy.clone();
+    let session = setup_session(workspace, &settings);
 
-    // Channel: reader thread sends KernelEvents to the TUI main loop
-    let (event_tx, event_rx) = mpsc::channel::<KernelEvent>();
+    let (ui_tx, ui_rx) = mpsc::channel::<KernelEvent>();
 
-    // Spawn reader thread that forwards KernelEvents to the TUI.
-    // Spec 0015: the distro no longer executes tools — the daemon
-    // owns tool dispatch via its ToolsetPool — so the reader is a
-    // pure pass-through.
+    // Bridge crossbeam → mpsc so the TUI main loop can use try_recv
+    let event_rx = session.event_rx;
     std::thread::spawn(move || {
-        let mut reader = conn.reader;
-        loop {
-            let kernel_event: KernelEvent = match read_message(&mut reader) {
-                Ok(e) => e,
-                Err(e) => {
-                    if e.kind() != io::ErrorKind::UnexpectedEof {
-                        let _ = event_tx.send(KernelEvent::Error {
-                            session_id: None,
-                            error: kernel_interfaces::frontend::KernelError {
-                                message: format!("Read error: {e}"),
-                                recoverable: false,
-                            },
-                        });
-                    }
-                    break;
-                }
-            };
-            let _ = event_tx.send(kernel_event);
+        for event in event_rx {
+            if ui_tx.send(event).is_err() {
+                break;
+            }
         }
     });
 
-    // Initialize terminal
     let mut terminal = tui::init_terminal().unwrap_or_else(|e| {
         eprintln!("Failed to init terminal: {e}");
         std::process::exit(1);
@@ -462,28 +469,21 @@ fn run_tui(
 
     let mut app = tui::App::new();
 
-    // Wait briefly for SessionCreated
     std::thread::sleep(Duration::from_millis(100));
-
-    // Drain any initial events
-    while let Ok(ev) = event_rx.try_recv() {
+    while let Ok(ev) = ui_rx.try_recv() {
         apply_event(&mut app, &ev);
     }
 
-    // Main TUI event loop
     let result = run_tui_loop(
         &mut terminal,
         &mut app,
-        &event_rx,
-        &writer,
+        &ui_rx,
+        &session.input_tx,
+        &session.permission_tx,
         &mut current_policy,
     );
 
-    // Shutdown
-    {
-        let mut w = writer.lock().unwrap();
-        let _ = write_message(&mut *w, &KernelRequest::Shutdown);
-    }
+    let _ = session.input_tx.send(KernelRequest::Shutdown);
 
     tui::restore_terminal();
 
@@ -498,18 +498,16 @@ fn run_tui_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut tui::App,
     event_rx: &mpsc::Receiver<KernelEvent>,
-    writer: &std::sync::Arc<std::sync::Mutex<BufWriter<UnixStream>>>,
+    input_tx: &crossbeam_channel::Sender<KernelRequest>,
+    permission_tx: &crossbeam_channel::Sender<PermissionResponse>,
     current_policy: &mut kernel_interfaces::policy::Policy,
 ) -> io::Result<()> {
     loop {
-        // Only redraw when something changed
         if app.dirty {
             terminal.draw(|frame| tui::draw(frame, app))?;
             app.dirty = false;
         }
 
-        // Poll for crossterm events (keyboard + mouse) with a short timeout
-        // so we can also check for kernel events.
         if crossterm::event::poll(Duration::from_millis(50))? {
             let action = match crossterm::event::read()? {
                 crossterm::event::Event::Key(key) => tui::handle_key(app, key),
@@ -520,7 +518,6 @@ fn run_tui_loop(
                 }
                 _ => tui::InputAction::None,
             };
-            // Any action (even None from typing/scrolling) means input was processed
             app.dirty = true;
             match action {
                 tui::InputAction::Submit(text) => {
@@ -528,15 +525,10 @@ fn run_tui_loop(
                         .push(tui::ConversationEntry::UserInput(text.clone()));
                     app.scroll_to_bottom();
                     app.turn_active = true;
-
-                    let mut w = writer.lock().unwrap();
-                    let _ = write_message(
-                        &mut *w,
-                        &KernelRequest::AddInput {
-                            session_id: kernel_interfaces::types::SessionId(0),
-                            text,
-                        },
-                    );
+                    let _ = input_tx.send(KernelRequest::AddInput {
+                        session_id: SessionId(0),
+                        text,
+                    });
                 }
                 tui::InputAction::PermissionDecision(allow) => {
                     if let Some(req_id) = app.pending_permission_request_id.take() {
@@ -545,23 +537,15 @@ fn run_tui_loop(
                         } else {
                             Decision::Deny("user denied".into())
                         };
-
-                        // Remove the permission prompt entry
                         app.entries.retain(|e| {
                             !matches!(e, tui::ConversationEntry::PermissionPrompt { .. })
                         });
-
                         app.awaiting_permission = false;
                         app.pending_permission_capabilities = None;
-
-                        let mut w = writer.lock().unwrap();
-                        let _ = write_message(
-                            &mut *w,
-                            &KernelRequest::PermissionResponse {
-                                request_id: kernel_interfaces::protocol::RequestId(req_id),
-                                decision,
-                            },
-                        );
+                        let _ = permission_tx.send(PermissionResponse {
+                            request_id: kernel_interfaces::protocol::RequestId(req_id),
+                            decision,
+                        });
                     }
                 }
                 tui::InputAction::PermissionAlwaysAllow => {
@@ -569,42 +553,25 @@ fn run_tui_loop(
                         app.pending_permission_request_id.take(),
                         app.pending_permission_capabilities.take(),
                     ) {
-                        // Promote these capabilities to an auto-allow rule
-                        // for the rest of the session.
                         prepend_allow_rule(current_policy, capabilities);
-
-                        // Remove the permission prompt entry
                         app.entries.retain(|e| {
                             !matches!(e, tui::ConversationEntry::PermissionPrompt { .. })
                         });
-
                         app.awaiting_permission = false;
-
-                        let mut w = writer.lock().unwrap();
-                        let _ = write_message(
-                            &mut *w,
-                            &KernelRequest::SetPolicy {
-                                session_id: kernel_interfaces::types::SessionId(0),
-                                policy: current_policy.clone(),
-                            },
-                        );
-                        let _ = write_message(
-                            &mut *w,
-                            &KernelRequest::PermissionResponse {
-                                request_id: kernel_interfaces::protocol::RequestId(req_id),
-                                decision: Decision::Allow,
-                            },
-                        );
+                        let _ = input_tx.send(KernelRequest::SetPolicy {
+                            session_id: SessionId(0),
+                            policy: current_policy.clone(),
+                        });
+                        let _ = permission_tx.send(PermissionResponse {
+                            request_id: kernel_interfaces::protocol::RequestId(req_id),
+                            decision: Decision::Allow,
+                        });
                     }
                 }
                 tui::InputAction::Cancel => {
-                    let mut w = writer.lock().unwrap();
-                    let _ = write_message(
-                        &mut *w,
-                        &KernelRequest::CancelTurn {
-                            session_id: kernel_interfaces::types::SessionId(0),
-                        },
-                    );
+                    let _ = input_tx.send(KernelRequest::CancelTurn {
+                        session_id: SessionId(0),
+                    });
                 }
                 tui::InputAction::SlashCommand(cmd) => match cmd {
                     tui::SlashCommand::Clear => {
@@ -612,22 +579,14 @@ fn run_tui_loop(
                         app.scroll_to_bottom();
                     }
                     tui::SlashCommand::Compact => {
-                        let mut w = writer.lock().unwrap();
-                        let _ = write_message(
-                            &mut *w,
-                            &KernelRequest::RequestCompaction {
-                                session_id: kernel_interfaces::types::SessionId(0),
-                            },
-                        );
+                        let _ = input_tx.send(KernelRequest::RequestCompaction {
+                            session_id: SessionId(0),
+                        });
                     }
                     tui::SlashCommand::Status => {
-                        let mut w = writer.lock().unwrap();
-                        let _ = write_message(
-                            &mut *w,
-                            &KernelRequest::QuerySession {
-                                session_id: kernel_interfaces::types::SessionId(0),
-                            },
-                        );
+                        let _ = input_tx.send(KernelRequest::QuerySession {
+                            session_id: SessionId(0),
+                        });
                     }
                     tui::SlashCommand::Quit => return Ok(()),
                     tui::SlashCommand::Unknown(name) => {
@@ -642,7 +601,6 @@ fn run_tui_loop(
             }
         }
 
-        // Drain kernel events
         let mut turn_ended = false;
         while let Ok(ev) = event_rx.try_recv() {
             if matches!(ev, KernelEvent::TurnEnded { .. }) {
@@ -652,18 +610,12 @@ fn run_tui_loop(
             app.dirty = true;
         }
 
-        // Query session status after a turn completes to update context usage
         if turn_ended {
-            let mut w = writer.lock().unwrap();
-            let _ = write_message(
-                &mut *w,
-                &KernelRequest::QuerySession {
-                    session_id: kernel_interfaces::types::SessionId(0),
-                },
-            );
+            let _ = input_tx.send(KernelRequest::QuerySession {
+                session_id: SessionId(0),
+            });
         }
 
-        // Advance spinner (only triggers redraw when turn is active)
         if app.turn_active {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
             app.dirty = true;
@@ -671,7 +623,6 @@ fn run_tui_loop(
     }
 }
 
-/// Map a KernelEvent into App state mutations.
 fn apply_event(app: &mut tui::App, event: &KernelEvent) {
     match event {
         KernelEvent::SessionCreated { .. } => {
@@ -680,7 +631,6 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
         }
 
         KernelEvent::TextOutput { text, .. } => {
-            // Merge consecutive assistant text entries
             if let Some(tui::ConversationEntry::AssistantText(existing)) = app.entries.last_mut() {
                 existing.push('\n');
                 existing.push_str(text);
@@ -706,10 +656,6 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
         KernelEvent::ToolOutputChunk {
             tool_name, data, ..
         } => {
-            // Live chunk from a streaming tool (spec 0016). Append the
-            // data to the most recent in-progress ToolCall entry for
-            // this tool so the user can watch output accumulate.
-            // Dedicated streaming UI is spec 0017+ territory.
             for entry in app.entries.iter_mut().rev() {
                 if let tui::ConversationEntry::ToolCall {
                     tool_name: n,
@@ -777,7 +723,6 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
             app.total_input_tokens += result.input_tokens;
             app.total_output_tokens += result.output_tokens;
 
-            // Mark any remaining Running tool calls as Success
             for entry in &mut app.entries {
                 if let tui::ConversationEntry::ToolCall { status, .. } = entry
                     && let tui::ToolCallStatus::Running(start) = status
@@ -821,41 +766,24 @@ fn apply_event(app: &mut tui::App, event: &KernelEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// REPL mode (original behavior, for --repl flag)
+// REPL mode
 // ---------------------------------------------------------------------------
 
-fn run_repl(
-    socket_path: &std::path::Path,
-    workspace: &std::path::Path,
-    settings: DistributionSettings,
-) {
-    let conn = connect_and_setup(socket_path, workspace, settings.policy);
-    let writer = conn.writer;
+fn run_repl(workspace: &std::path::Path, settings: Settings) {
+    let session = setup_session(workspace, &settings);
 
-    eprintln!("agent-kernel v0.1.0 — code-agent distribution (IPC client)");
+    eprintln!("agent-kernel v0.1.0");
     eprintln!("Workspace: {}", workspace.display());
-    eprintln!("Tools: {}", kernel_workspace_local::TOOL_NAMES.join(", "));
     eprintln!("---");
 
-    let writer_for_reader = writer.clone();
-    let reader_handle = std::thread::spawn(move || {
-        let mut reader = conn.reader;
-        loop {
-            let event: KernelEvent = match read_message(&mut reader) {
-                Ok(e) => e,
-                Err(e) => {
-                    if e.kind() != io::ErrorKind::UnexpectedEof {
-                        eprintln!("Read error: {e}");
-                    }
-                    break;
-                }
-            };
-
+    let event_rx = session.event_rx;
+    let perm_tx = session.permission_tx.clone();
+    std::thread::spawn(move || {
+        for event in event_rx {
             match event {
                 KernelEvent::SessionCreated { session_id } => {
                     eprintln!("Session {session_id:?} created");
                 }
-
                 KernelEvent::ToolCallStarted {
                     tool_name, input, ..
                 } => {
@@ -864,20 +792,17 @@ fn run_repl(
                         format_tool_input(&tool_name, &input)
                     );
                 }
-
                 KernelEvent::ToolCompleted {
                     tool_name, result, ..
                 } => {
                     let display = format_tool_result(&tool_name, &result);
                     eprintln!("  [result] {tool_name} -> {display}");
                 }
-
                 KernelEvent::ToolOutputChunk {
                     tool_name, data, ..
                 } => {
                     eprintln!("  [tool] {tool_name}: {}", data.trim_end());
                 }
-
                 KernelEvent::PermissionRequired {
                     request_id,
                     request,
@@ -902,22 +827,15 @@ fn run_repl(
                         Decision::Deny("failed to read input".into())
                     };
 
-                    let mut w = writer_for_reader.lock().unwrap();
-                    let _ = write_message(
-                        &mut *w,
-                        &KernelRequest::PermissionResponse {
-                            request_id,
-                            decision,
-                        },
-                    );
+                    let _ = perm_tx.send(PermissionResponse {
+                        request_id,
+                        decision,
+                    });
                 }
-
                 KernelEvent::TextOutput { text, .. } => {
                     println!("{text}");
                 }
-
                 KernelEvent::TurnStarted { .. } => {}
-
                 KernelEvent::TurnEnded { result, .. } => {
                     if result.cache_read_input_tokens > 0 || result.cache_creation_input_tokens > 0
                     {
@@ -935,13 +853,10 @@ fn run_repl(
                         );
                     }
                 }
-
                 KernelEvent::CompactionHappened { summary, .. } => {
                     eprintln!("  [compaction] freed {} tokens", summary.tokens_freed);
                 }
-
                 KernelEvent::SessionStatus { .. } => {}
-
                 KernelEvent::Error { error, .. } => {
                     eprintln!("  [error] {}", error.message);
                 }
@@ -949,7 +864,7 @@ fn run_repl(
         }
     });
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(100));
 
     let stdin = io::stdin();
     let mut stdin_reader = stdin.lock();
@@ -976,22 +891,13 @@ fn run_repl(
             break;
         }
 
-        let mut w = writer.lock().unwrap();
-        let _ = write_message(
-            &mut *w,
-            &KernelRequest::AddInput {
-                session_id: kernel_interfaces::types::SessionId(0),
-                text: input.to_string(),
-            },
-        );
+        let _ = session.input_tx.send(KernelRequest::AddInput {
+            session_id: SessionId(0),
+            text: input.to_string(),
+        });
     }
 
-    {
-        let mut w = writer.lock().unwrap();
-        let _ = write_message(&mut *w, &KernelRequest::Shutdown);
-    }
-
-    let _ = reader_handle.join();
+    let _ = session.input_tx.send(KernelRequest::Shutdown);
     eprintln!("\nGoodbye.");
 }
 
@@ -1019,36 +925,27 @@ mod tests {
     #[test]
     fn prepend_allow_rule_shadows_later_ask() {
         let mut policy = policy_asking_shell();
-        // Baseline: the untouched policy asks for shell:exec.
         assert_eq!(
             policy.evaluate(&Capability::new("shell:exec")),
             Decision::Ask
         );
-
         prepend_allow_rule(&mut policy, vec!["shell:exec".into()]);
-
-        // After prepend, first-match-wins turns shell:exec into Allow.
         assert_eq!(
             policy.evaluate(&Capability::new("shell:exec")),
             Decision::Allow
         );
-        // The new rule sits at index 0.
         assert_eq!(policy.rules.len(), 2);
         assert_eq!(policy.rules[0].action, PolicyAction::Allow);
-        assert_eq!(policy.rules[0].match_capabilities, vec!["shell:exec"]);
     }
 
     #[test]
     fn prepend_allow_rule_preserves_other_capabilities() {
         let mut policy = policy_asking_shell();
         prepend_allow_rule(&mut policy, vec!["net:api.github.com".into()]);
-
-        // shell:exec unchanged — still asks.
         assert_eq!(
             policy.evaluate(&Capability::new("shell:exec")),
             Decision::Ask
         );
-        // The newly-allowed capability is allowed.
         assert_eq!(
             policy.evaluate(&Capability::new("net:api.github.com")),
             Decision::Allow

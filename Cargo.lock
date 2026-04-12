@@ -9,6 +9,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-kernel"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "crossterm",
+ "kernel-core",
+ "kernel-interfaces",
+ "kernel-providers",
+ "kernel-workspace-local",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "toml",
+ "unicode-width 0.1.14",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -213,23 +233,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "dist-code-agent"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "kernel-core",
- "kernel-interfaces",
- "kernel-workspace-local",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -542,21 +545,6 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "kernel-interfaces",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "kernel-daemon"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "kernel-core",
- "kernel-interfaces",
- "kernel-providers",
  "serde",
  "serde_json",
  "serde_yaml",

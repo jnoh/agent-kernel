@@ -224,7 +224,7 @@ Tier 3 is not abstract. Every mutation to the in-memory view — `append_user_in
 
 The `SessionEventSink` trait, the `SessionEvent` enum, and the `WorkspaceFingerprint` / `FingerprintMatch` types live in `kernel-interfaces` (see §4.6) — distributions can implement a custom sink (SQLite, Postgres, cloud object store) by depending only on the stable API crate. Concrete sink impls and runtime helpers stay in `kernel-core`. Four sinks ship in `kernel-core`: `NullSink` (drops every event — the default for unit tests and in-process library callers), `FileSink` (appends one JSON object per line to a specified path, `u64` millisecond timestamps, serde-tagged variants), `HttpSink` (POSTs each event as a single JSON object to `<endpoint>/events` over a hand-rolled `std::net::TcpStream` HTTP/1.1 client — no dependencies, `http://` only, optional bearer token, 2-second timeout, audit-only fire-and-forget with a `failed_writes` counter), and `TeeSink<A, B>` (a generic composite that fans `record()` out to two inner sinks). `SessionEventSink` is also implemented for `Box<dyn SessionEventSink>`, so `TeeSink` can hold a runtime-selected primary sink alongside a concrete secondary. `ContextManager` exposes `new`, `with_store`, `with_event_sink`, and `with_store_and_events` constructors so test and production call sites can mix-and-match store and sink independently. `FileSink` and `HttpSink` both expose `failed_writes()` for observability — a non-zero counter means the stream is no longer authoritative for that sink.
 
-The `kernel-daemon` router wires a `FileSink` for every session it creates, resolving the path via `session_events::default_events_path(session_id)`. The base directory is `$AGENT_KERNEL_HOME` if set, else `$HOME/.agent-kernel`, else `./.agent-kernel`; the events file lives at `<base>/sessions/{id}/events.jsonl`. Sessions are globally addressable — the workspace is recorded inside the `SessionStarted` event as metadata, not encoded in the filesystem path, so any past session's events can be located without knowing the original workspace. If `FileSink::new` fails (unwritable base directory) the daemon falls back to `NullSink` with a stderr warning rather than aborting session creation. If `AGENT_KERNEL_REMOTE_SINK_URL` is set, the router additionally constructs an `HttpSink` (with optional `AGENT_KERNEL_REMOTE_SINK_TOKEN` bearer auth) and wraps both sinks in a `TeeSink` so every event is mirrored to the remote endpoint for one-way audit/archival; a malformed URL logs to stderr and falls back to local-only, and remote delivery failures are counted but never block the turn loop. True remote session execution and remote hydration are out of scope here — the kernel still runs locally.
+The binary's session setup wires a `FileSink` for every session it creates, resolving the path via `session_events::default_events_path(session_id)`. The base directory is `$AGENT_KERNEL_HOME` if set, else `$HOME/.agent-kernel`, else `./.agent-kernel`; the events file lives at `<base>/sessions/{id}/events.jsonl`. Sessions are globally addressable — the workspace is recorded inside the `SessionStarted` event as metadata, not encoded in the filesystem path, so any past session's events can be located without knowing the original workspace. If `FileSink::new` fails (unwritable base directory) the binary falls back to `NullSink` with a stderr warning rather than aborting session creation. If `AGENT_KERNEL_REMOTE_SINK_URL` is set, it additionally constructs an `HttpSink` (with optional `AGENT_KERNEL_REMOTE_SINK_TOKEN` bearer auth) and wraps both sinks in a `TeeSink` so every event is mirrored to the remote endpoint for one-way audit/archival; a malformed URL logs to stderr and falls back to local-only, and remote delivery failures are counted but never block the turn loop. True remote session execution and remote hydration are out of scope here — the kernel still runs locally.
 
 **Replay and hydration.** The read side lives in the same module. `session_events::read_events_from_file(path)` parses a JSONL file line-by-line into `Vec<SessionEvent>`, failing with `io::ErrorKind::InvalidData` and the 1-based line number on the first malformed entry — no forward recovery. `ContextManager::replay_events(&[SessionEvent])` walks an event slice and calls the same `append_*` methods that wrote them (against a `NullSink` so replay doesn't duplicate events back out to disk); `ContextManager::hydrated_from_events(config, events)` is the constructor form, which requires `SessionStarted` as the first event to recover the original `system_prompt`. `SessionManager::hydrate_from_events` builds a full `Session` around a hydrated `ContextManager` and registers it — policy, tools, completion config, and resource budget are caller-provided because they aren't round-trippable through the current event schema. Full cross-machine workspace sync is deferred, but `SessionStarted` carries an optional `WorkspaceFingerprint` (git commit, branch, dirty flag, absolute path — produced by `session_events::fingerprint_workspace(path)`, which degrades gracefully on non-git directories) recorded at session-create time, and `hydrate_from_events` takes a `verify_workspace: bool` flag that, when true, recomputes the current fingerprint and rejects hydration on `FingerprintMatch::CommitMismatch` (logging a warning for `SameCommitDirty`, proceeding silently for `Identical` / `Unknown`). The fingerprint field uses `#[serde(default)]` so pre-fingerprint event files still deserialize. This is a safety rail for the manual "git push, then hydrate" workflow, not a replacement for it.
 
@@ -312,7 +312,7 @@ struct Session {
     turn_loop: TurnLoop,                  // its own turn loop instance
     context_manager: ContextManager,      // its own context window
     permission_evaluator: PermissionEvaluator, // its own policy
-    tools: Vec<Arc<dyn ToolRegistration>>, // Arc because the daemon-wide ToolsetPool shares tools across sessions
+    tools: Vec<Arc<dyn ToolRegistration>>, // Arc because the process-wide ToolsetPool shares tools across sessions
     frontend: Box<dyn FrontendEvents>,
     mode: SessionMode,                    // interactive or autonomous
     resource_budget: ResourceBudget,      // carved from global budget
@@ -406,7 +406,7 @@ fn run_turn(&mut self) {
 
 **For v0.1:** the session manager manages exactly one session. The interface exists so that v0.2 can add multi-session, child spawning, and webhook delivery without breaking the core architecture.
 
-**Shipped session-construction entry points:** `spawn_interactive` (default `NullSink`), `spawn_interactive_with_events` (caller supplies a `Box<dyn SessionEventSink>`, used by the daemon and by event-stream integration tests), and `hydrate_from_events` (reads an `events.jsonl` file and reconstructs an in-memory session via `ContextManager::hydrated_from_events`). `spawn_child` and `spawn_from_event` remain interface-only until multi-session lands.
+**Shipped session-construction entry points:** `spawn_interactive` (default `NullSink`), `spawn_interactive_with_events` (caller supplies a `Box<dyn SessionEventSink>`, used by the binary's session setup and by event-stream integration tests), and `hydrate_from_events` (reads an `events.jsonl` file and reconstructs an in-memory session via `ContextManager::hydrated_from_events`). `spawn_child` and `spawn_from_event` remain interface-only until multi-session lands.
 
 ---
 
@@ -554,7 +554,7 @@ All tools — regardless of implementation language or execution model — regis
 
 All three paths produce `Arc<dyn ToolRegistration>` and are grouped into a `ToolSet` (§4.2.1). The kernel, context manager, and permission evaluator treat them identically. The only difference is execution latency.
 
-#### 4.2.1 ToolSet and the daemon toolset pool
+#### 4.2.1 ToolSet and the toolset pool
 
 A **`ToolSet`** is a named group of tools that share a lifetime and origin — a single
 local workspace, a single MCP server, a single HTTP tool server. The trait lives in
@@ -567,16 +567,14 @@ pub trait ToolSet: Send + Sync {
 }
 ```
 
-The daemon (`kernel-daemon::toolset_pool`) owns a **`ToolsetPool`** at process lifetime,
+The binary (`kernel-core::toolset_pool`) owns a **`ToolsetPool`** at process lifetime,
 built at startup from `[[toolset]]` entries in the distribution manifest. Each entry has
 a `kind` string (e.g. `"mcp.stdio"`), an optional `id`, and an opaque
 `[toolset.config]` block. A `FactoryRegistry` maps `kind` → factory function, returning
 `Box<dyn ToolSet>`. `ToolsetPool::build` calls each factory, collects every set's tools
 into a merged `Vec<Arc<dyn ToolRegistration>>`, and fails hard on name collisions across
-sets. At session create, `ConnectionRouter` calls `pool.tools_for_session()` to snapshot
-the shared tool list into the new session — the old `RegisterTools` / `ExecuteTool` /
-`ToolResult` round-trip between daemon and distribution is gone, along with the
-`proxy_tool.rs` and `in_process.rs` modules that implemented it. Dispatch is now
+sets. At session create, the binary calls `pool.tools_for_session()` to snapshot
+the shared tool list into the new session. Dispatch is
 entirely kernel-owned: the turn loop calls `tool.execute(...)` directly on an `Arc`-held
 tool and, when a tool finishes, emits a `KernelEvent::ToolCompleted` so the frontend
 sees the result without any distro-side execution hop.
@@ -585,10 +583,10 @@ The one built-in factory registered in `default_registry()` is
 `"mcp.stdio" → kernel_core::mcp_stdio::from_entry`. This factory spawns a subprocess
 (typically the `kernel-workspace-local` binary) and proxies tool calls over newline-delimited
 JSON-RPC 2.0 on the child's stdio, implementing the MCP subset described below. The previous
-`"workspace.local"` in-process factory was removed in spec 0016 — the daemon no longer depends
+`"workspace.local"` in-process factory was removed in spec 0016 — the binary no longer depends
 on the `kernel-workspace-local` library crate at all. `kernel-workspace-local` remains as a
 standalone binary and library (hosting `file_read`, `file_write`, `file_edit`, `grep`, `glob`,
-`ls`, `shell`) that `dist-code-agent` still references for `TOOL_NAMES`.
+`ls`, `shell`) that `agent-kernel` still references for `TOOL_NAMES`.
 
 **MCP stdio transport (spec 0016).** `McpStdioToolSet` in `kernel-core::mcp_stdio` owns the
 child process, its stdin/stdout pipes, and a cached `tools/list` response. Each tool is
@@ -597,8 +595,8 @@ exposed as an `McpToolHandle` implementing `ToolRegistration`; `execute` seriali
 blocking loop until the matching response arrives, and forwards any `notifications/progress`
 messages (carrying `agent_kernel/chunk` extension data) to `ctx.emit_chunk`. Capabilities are
 inferred from tool names — a known-brittle first-draft hack sufficient for the six first-party
-tools. Process lifecycle is per-daemon: children are spawned once at `ToolsetPool::build` and
-live for the daemon's lifetime; a crashed child (stdout EOF) triggers one synchronous respawn
+tools. Process lifecycle is per-binary: children are spawned once at `ToolsetPool::build` and
+live for the process's lifetime; a crashed child (stdout EOF) triggers one synchronous respawn
 attempt on the next `tools/call`. Wire format is newline-delimited JSON (not MCP's
 Content-Length framing) since both ends are first-party; spec-compliant framing will land
 before the kernel talks to real third-party MCP servers.
@@ -613,7 +611,7 @@ turn loop builds a fresh ctx per tool call whose sink forwards to
 `FrontendEvents::on_tool_output_chunk(tool_name, stream, data)` (empty default impl, so
 existing frontends need no changes). Spec 0016 added the wire-level event
 `KernelEvent::ToolOutputChunk { session_id, tool_name, stream, data }` so chunks cross the
-Unix socket to the distribution. `ProxyFrontend::on_tool_output_chunk` sends this event; the
+crossbeam channel to the frontend thread. `ProxyFrontend::on_tool_output_chunk` sends this event; the
 TUI appends chunk data to the in-progress `ToolCall` entry's `result_summary`, and the REPL
 handler prints each chunk to stderr with a `[tool]` prefix. The model still sees a single
 complete `tool_result` at call end via `ToolCompleted`.
@@ -932,7 +930,7 @@ These tools have empty capability sets — they don't touch external resources. 
 
 ### Distribution tools (provided by distributions, not the kernel)
 
-The reference `dist-code-agent` distribution ships with these tools:
+The reference `agent-kernel` distribution ships with these tools:
 
 | Tool | Capabilities | Path | Description |
 |------|-------------|------|-------------|
@@ -1003,7 +1001,7 @@ The `@tool` decorator generates the `tool.toml` manifest at publish time from th
 
 A distribution is a **manifest of manifests** — tools + policy + skills + provider config + frontend. It packages the kernel with everything needed for a specific agent use case. The relationship is Linux kernel to Ubuntu/Fedora/Android.
 
-The first real manifest ships in `distros/code-agent.toml`, loaded at startup by both `kernel-daemon --distro <path>` (provider selection, specs 0011) and `dist-code-agent --distro <path>` (policy file, tool filter, frontend kind — specs 0012, 0013, 0014):
+The first real manifest ships in `distros/code-agent.toml`, loaded at startup by `agent-kernel --manifest <path>` (provider selection, policy, toolsets, frontend kind — specs 0011-0014, 0017):
 
 ```toml
 # distros/code-agent.toml
@@ -1033,17 +1031,17 @@ root = "."
 type = "tui"                  # "tui" or "repl"
 ```
 
-The `DistributionManifest` type and its section structs (`ProviderConfig`, `PolicyConfig`, `ToolsetEntry`, `FrontendConfig`) live in `kernel-interfaces::manifest` so both the daemon and distribution binaries parse the same shape. The `[[toolset]]` array is consumed by the daemon: at startup, `ToolsetPool::build` dispatches each entry's `kind` against `default_registry()` and hands the resulting `Box<dyn ToolSet>` values to the pool. Distributions no longer ship tools themselves — `dist-code-agent` consumes only `[provider]`, `[policy]`, and `[frontend]`, and receives its tool list at session create from the daemon's pool. A legacy `[tools] enabled = [...]` section now fails to parse.
+The `DistributionManifest` type and its section structs (`ProviderConfig`, `PolicyConfig`, `ToolsetEntry`, `FrontendConfig`) live in `kernel-interfaces::manifest` so any consumer parses the same shape. The `[[toolset]]` array is consumed at startup: `ToolsetPool::build` (in `kernel-core`) dispatches each entry's `kind` against `default_registry()` and hands the resulting `Box<dyn ToolSet>` values to the pool. The single `agent-kernel` binary consumes all manifest sections — `[provider]`, `[policy]`, `[[toolset]]`, and `[frontend]` — and snapshots the tool pool into each new session. A legacy `[tools] enabled = [...]` section now fails to parse.
 
 **What works today vs the full vision:**
 - Provider, policy file, toolset entries, and frontend kind are all manifest-driven.
-- The one factory registered in `default_registry()` is `"mcp.stdio"`, backed by `kernel_core::mcp_stdio::from_entry`, which spawns a subprocess and proxies tool calls over JSON-RPC (see §4.2.1). The daemon no longer depends on `kernel-workspace-local` directly.
-- Frontends are still compile-time: `FrontendKind::Tui` and `FrontendKind::Repl` both live inside `dist-code-agent`. A `frontend-tui` / `frontend-repl` split and headless variants are future work.
+- The one factory registered in `default_registry()` is `"mcp.stdio"`, backed by `kernel_core::mcp_stdio::from_entry`, which spawns a subprocess and proxies tool calls over JSON-RPC (see §4.2.1).
+- Frontends are still compile-time: `FrontendKind::Tui` and `FrontendKind::Repl` both live inside the `agent-kernel` crate. A `frontend-tui` / `frontend-repl` split and headless variants are future work.
 - `[skills]` is not parsed.
-- There is no `agent-kernel install` subcommand; deployment is "run the daemon with `--distro`, run the distro binary with `--distro`." CLI-level overrides (`--policy`, `--frontend`, `--tool-catalog`) are not implemented — the `--repl` flag on `dist-code-agent` still works but prints a deprecation warning pointing at `[frontend] type = "repl"`.
+- Deployment is a single binary: `agent-kernel --manifest <path>`. CLI-level overrides (`--policy`, `--frontend`, `--tool-catalog`) are not implemented — the `--repl` flag still works but prints a deprecation warning pointing at `[frontend] type = "repl"`.
 - Distribution authors still need to touch Rust to add a new tool or frontend. The manifest is the seam; the plugin points aren't open yet.
 
-The end-state remains: distribution authors write tools, policies, skills, and a TOML manifest; they do not touch Rust. Specs 0011-0014 moved configuration out of Rust; moving *implementations* out of Rust is the next arc.
+The end-state remains: distribution authors write tools, policies, skills, and a TOML manifest; they do not touch Rust. Specs 0011-0014 moved configuration out of Rust; spec 0017 collapsed the daemon into the single binary; moving *implementations* out of Rust is the next arc.
 
 ---
 
@@ -1071,15 +1069,15 @@ Skills can be:
 
 ## 9. Configuration
 
-There is no separate `agent-kernel.toml` — the distribution manifest (§7) is the single configuration file. Both the daemon and the distribution binary take `--distro <path>` and read the same file, each consuming the sections relevant to their role:
+There is no separate `agent-kernel.toml` — the distribution manifest (§7) is the single configuration file. The `agent-kernel` binary takes `--manifest <path>` and consumes all sections:
 
-| Section | Consumer | Effect |
-|---|---|---|
-| `[distribution]` | both | Name + version string, printed at startup for operator visibility. |
-| `[provider]` | `kernel-daemon` | Selects `AnthropicProvider` / `EchoProvider`, reads the API key from `api_key_env`, optionally falls back to `echo` when the env var is missing. |
-| `[policy]` | `dist-code-agent` | `file = "..."` points at a YAML policy file; the path is resolved relative to the manifest's directory. |
-| `[[toolset]]` | `kernel-daemon` | Each entry has a `kind` (dispatched against `default_registry()`), an optional `id`, and an opaque `[toolset.config]` block. For `kind = "mcp.stdio"`, the config must include `command` (binary name, resolved via `$PATH`) and optionally `args`. `ToolsetPool::build` constructs each set at startup; the merged tool list is snapshotted into every new session. |
-| `[frontend]` | `dist-code-agent` | `type = "tui"` or `type = "repl"`. Overrides the deprecated `--repl` CLI flag. |
+| Section | Effect |
+|---|---|
+| `[distribution]` | Name + version string, printed at startup for operator visibility. |
+| `[provider]` | Selects `AnthropicProvider` / `EchoProvider`, reads the API key from `api_key_env`, optionally falls back to `echo` when the env var is missing. |
+| `[policy]` | `file = "..."` points at a YAML policy file; the path is resolved relative to the manifest's directory. |
+| `[[toolset]]` | Each entry has a `kind` (dispatched against `default_registry()`), an optional `id`, and an opaque `[toolset.config]` block. For `kind = "mcp.stdio"`, the config must include `command` (binary name, resolved via `$PATH`) and optionally `args`. `ToolsetPool::build` constructs each set at startup; the merged tool list is snapshotted into every new session. |
+| `[frontend]` | `type = "tui"` or `type = "repl"`. Overrides the deprecated `--repl` CLI flag. |
 
 Kernel-level tuning (context window, compaction threshold, token budgets) and channel/skill config are not yet exposed in the manifest — those values live in Rust today and will grow new sections as the relevant subsystems mature. See `distros/code-agent.toml` for the current concrete example.
 
@@ -1141,11 +1139,10 @@ Rust is the recommended implementation language. Rationale:
 agent-kernel/
 ├── crates/
 │   ├── kernel-interfaces/    # ProviderInterface, ToolRegistration, manifest types, etc. (stable API surface)
-│   ├── kernel-core/          # Turn loop, context manager, permission evaluator, session manager
+│   ├── kernel-core/          # Turn loop, context manager, permission evaluator, session manager, ToolsetPool
 │   ├── kernel-providers/     # First-party ProviderInterface impls (AnthropicProvider, EchoProvider)
 │   ├── kernel-workspace-local/ # Built-in ToolSet: six filesystem tools over a local root
-│   ├── kernel-daemon/        # Unix-socket daemon hosting the kernel; owns the ToolsetPool and wires providers per session
-│   └── dist-code-agent/      # Reference coding agent distribution (TUI frontend; no tools)
+│   └── agent-kernel/         # Single-binary entry point: loads manifest, builds provider + toolset pool, runs TUI/REPL
 ├── policies/
 │   ├── permissive.yaml
 │   └── lockdown.yaml
