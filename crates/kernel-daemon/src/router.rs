@@ -5,7 +5,9 @@ use crossbeam_channel::Sender;
 use kernel_core::event_loop::{EventLoop, EventLoopConfig};
 use kernel_core::proxy_frontend::ProxyFrontend;
 use kernel_core::proxy_tool::{ProxyTool, ToolResponse};
-use kernel_core::session_events::{FileSink, NullSink, SessionEventSink, default_events_path};
+use kernel_core::session_events::{
+    FileSink, HttpSink, NullSink, SessionEventSink, TeeSink, default_events_path,
+};
 use kernel_interfaces::protocol::{KernelEvent, KernelRequest, ToolSchema};
 use kernel_interfaces::provider::ProviderInterface;
 use kernel_interfaces::tool::ToolRegistration;
@@ -104,21 +106,45 @@ impl ConnectionRouter {
                     Duration::from_secs(300), // 5 min for permission decisions
                 );
 
-                // Construct the session-events sink. Path:
+                // Construct the session-events sink. Local path:
                 // $AGENT_KERNEL_HOME or $HOME/.agent-kernel/sessions/{id}/events.jsonl.
-                // If that base dir is unwritable, fall back to a NullSink
-                // so the event loop can still run.
+                // If that base dir is unwritable, fall back to a NullSink.
+                // If AGENT_KERNEL_REMOTE_SINK_URL is set, tee every event
+                // to an HttpSink as well (spec 0007 — audit-only).
                 let events: Box<dyn SessionEventSink> = {
                     let log_path = default_events_path(session_id);
-                    match FileSink::new(session_id, &log_path) {
-                        Ok(sink) => Box::new(sink),
-                        Err(e) => {
-                            eprintln!(
-                                "  session_events: failed to open {} ({e}); using NullSink",
-                                log_path.display()
-                            );
-                            Box::new(NullSink::new(session_id))
+                    let local: Box<dyn SessionEventSink> =
+                        match FileSink::new(session_id, &log_path) {
+                            Ok(sink) => Box::new(sink),
+                            Err(e) => {
+                                eprintln!(
+                                    "  session_events: failed to open {} ({e}); using NullSink",
+                                    log_path.display()
+                                );
+                                Box::new(NullSink::new(session_id))
+                            }
+                        };
+
+                    match std::env::var("AGENT_KERNEL_REMOTE_SINK_URL") {
+                        Ok(url) if !url.is_empty() => {
+                            let token = std::env::var("AGENT_KERNEL_REMOTE_SINK_TOKEN").ok();
+                            match HttpSink::new(session_id, &url, token) {
+                                Ok(remote) => {
+                                    eprintln!(
+                                        "  session_events: teeing to remote sink {}",
+                                        remote.endpoint()
+                                    );
+                                    Box::new(TeeSink::new(local, remote))
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "  session_events: bad remote sink URL ({e}); local only"
+                                    );
+                                    local
+                                }
+                            }
                         }
+                        _ => local,
                     }
                 };
 

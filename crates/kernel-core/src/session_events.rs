@@ -18,9 +18,10 @@
 use kernel_interfaces::types::SessionId;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One event in the session's event stream.
 ///
@@ -70,6 +71,19 @@ pub enum SessionEvent {
 pub trait SessionEventSink: Send {
     fn session_id(&self) -> SessionId;
     fn record(&mut self, event: SessionEvent);
+}
+
+/// Forwarding impl so `Box<dyn SessionEventSink>` is itself a
+/// `SessionEventSink`. Required by `TeeSink<A, B>` when either half
+/// needs to hold a trait object (e.g., the daemon's local sink,
+/// which is `FileSink` or `NullSink` depending on runtime state).
+impl SessionEventSink for Box<dyn SessionEventSink> {
+    fn session_id(&self) -> SessionId {
+        (**self).session_id()
+    }
+    fn record(&mut self, event: SessionEvent) {
+        (**self).record(event);
+    }
 }
 
 /// Read a JSONL event file into a vector. Each line is one event.
@@ -229,6 +243,175 @@ impl SessionEventSink for FileSink {
             eprintln!(
                 "session_events: flush failed for session {}: {}",
                 self.session_id.0, e
+            );
+            self.failed_writes += 1;
+        }
+    }
+}
+
+/// Composite sink that fans `record` calls out to two inner sinks.
+/// Used by the daemon (spec 0007) to write every event to a local
+/// `FileSink` and a remote `HttpSink` simultaneously.
+pub struct TeeSink<A: SessionEventSink, B: SessionEventSink> {
+    primary: A,
+    secondary: B,
+}
+
+impl<A: SessionEventSink, B: SessionEventSink> TeeSink<A, B> {
+    pub fn new(primary: A, secondary: B) -> Self {
+        Self { primary, secondary }
+    }
+}
+
+impl<A: SessionEventSink, B: SessionEventSink> SessionEventSink for TeeSink<A, B> {
+    fn session_id(&self) -> SessionId {
+        self.primary.session_id()
+    }
+
+    fn record(&mut self, event: SessionEvent) {
+        // Clone so both sinks get the event. `SessionEvent` is `Clone`.
+        self.primary.record(event.clone());
+        self.secondary.record(event);
+    }
+}
+
+/// HTTP POST sink. Fires-and-forgets each event to a configured
+/// `http://` endpoint.
+///
+/// **Audit-only** — this sink is best-effort, synchronous, http-only
+/// (no TLS), no retry, no queue. Per the spec 0007 rationale, adding a
+/// TLS-capable HTTP client would pull in ~15 transitive crates for a
+/// feature whose primary use case is localhost POST to a log
+/// aggregator. A future spec can add an HTTPS variant.
+///
+/// `record()` blocks on the network call up to the request timeout
+/// (2 seconds by default). A slow or unreachable endpoint bumps
+/// `failed_writes` and returns; it never panics and never stalls the
+/// turn loop indefinitely.
+pub struct HttpSink {
+    session_id: SessionId,
+    host: String,
+    port: u16,
+    path: String,
+    bearer_token: Option<String>,
+    timeout: Duration,
+    failed_writes: u64,
+}
+
+impl HttpSink {
+    /// Construct an HTTP sink. Parses the endpoint URL eagerly so
+    /// config errors are caught at session creation rather than at
+    /// the first event. Only `http://host[:port][/path]` URLs are
+    /// accepted.
+    pub fn new(
+        session_id: SessionId,
+        endpoint_url: &str,
+        bearer_token: Option<String>,
+    ) -> Result<Self, String> {
+        let rest = endpoint_url
+            .strip_prefix("http://")
+            .ok_or_else(|| format!("HttpSink only accepts http:// URLs, got {endpoint_url}"))?;
+        let (host_port, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let (host, port) = match host_port.rfind(':') {
+            Some(i) => {
+                let port: u16 = host_port[i + 1..]
+                    .parse()
+                    .map_err(|_| format!("invalid port in URL: {endpoint_url}"))?;
+                (host_port[..i].to_string(), port)
+            }
+            None => (host_port.to_string(), 80),
+        };
+        if host.is_empty() {
+            return Err(format!("empty host in URL: {endpoint_url}"));
+        }
+        Ok(Self {
+            session_id,
+            host,
+            port,
+            path: path.to_string(),
+            bearer_token,
+            timeout: Duration::from_secs(2),
+            failed_writes: 0,
+        })
+    }
+
+    pub fn failed_writes(&self) -> u64 {
+        self.failed_writes
+    }
+
+    pub fn endpoint(&self) -> String {
+        format!("http://{}:{}{}", self.host, self.port, self.path)
+    }
+
+    fn post(&self, body: &str) -> std::io::Result<()> {
+        let addr = (self.host.as_str(), self.port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses resolved")
+            })?;
+        let mut stream = TcpStream::connect_timeout(&addr, self.timeout)?;
+        stream.set_write_timeout(Some(self.timeout))?;
+        stream.set_read_timeout(Some(self.timeout))?;
+
+        let auth_header = match &self.bearer_token {
+            Some(t) => format!("Authorization: Bearer {t}\r\n"),
+            None => String::new(),
+        };
+        let request = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             {auth_header}\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            path = self.path,
+            host = self.host,
+            port = self.port,
+            len = body.len(),
+            auth_header = auth_header,
+            body = body,
+        );
+        stream.write_all(request.as_bytes())?;
+        stream.flush()?;
+
+        // Read the status line so the server gets to finish writing
+        // before we drop the socket. We don't parse it; any 2xx or 3xx
+        // is fine for audit-only use.
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf);
+        Ok(())
+    }
+}
+
+impl SessionEventSink for HttpSink {
+    fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    fn record(&mut self, event: SessionEvent) {
+        let body = match serde_json::to_string(&event) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "session_events: HttpSink serialize failed for session {}: {}",
+                    self.session_id.0, e
+                );
+                self.failed_writes += 1;
+                return;
+            }
+        };
+        if let Err(e) = self.post(&body) {
+            eprintln!(
+                "session_events: HttpSink POST to {} failed for session {}: {}",
+                self.endpoint(),
+                self.session_id.0,
+                e
             );
             self.failed_writes += 1;
         }
@@ -437,6 +620,139 @@ mod tests {
             err.to_string().contains("line 2"),
             "expected line number in error, got: {err}"
         );
+    }
+
+    /// Shared-memory test sink for assertions on what was recorded.
+    /// Publicly available from this module's test scope so the TeeSink
+    /// test can use it as both inner sinks.
+    #[derive(Clone)]
+    struct VecSink {
+        session_id: SessionId,
+        events: std::sync::Arc<std::sync::Mutex<Vec<SessionEvent>>>,
+    }
+
+    impl VecSink {
+        fn new(session_id: SessionId) -> Self {
+            Self {
+                session_id,
+                events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+        fn snapshot(&self) -> Vec<SessionEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl SessionEventSink for VecSink {
+        fn session_id(&self) -> SessionId {
+            self.session_id
+        }
+        fn record(&mut self, event: SessionEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[test]
+    fn tee_sink_fans_out_to_both() {
+        let a = VecSink::new(SessionId(1));
+        let b = VecSink::new(SessionId(2));
+        let a_handle = a.clone();
+        let b_handle = b.clone();
+        let mut tee = TeeSink::new(a, b);
+
+        for i in 0..3 {
+            tee.record(SessionEvent::UserInput {
+                timestamp_ms: i,
+                turn_index: i as usize,
+                text: format!("msg {i}"),
+            });
+        }
+
+        let a_events = a_handle.snapshot();
+        let b_events = b_handle.snapshot();
+        assert_eq!(a_events.len(), 3);
+        assert_eq!(b_events.len(), 3);
+        assert_eq!(a_events, b_events);
+        // TeeSink's session_id comes from the primary (first) inner.
+        assert_eq!(tee.session_id(), SessionId(1));
+    }
+
+    #[test]
+    fn http_sink_new_rejects_non_http_urls() {
+        match HttpSink::new(SessionId(0), "https://example.com/events", None) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => assert!(e.contains("http://")),
+        }
+        match HttpSink::new(SessionId(0), "ftp://example.com", None) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => assert!(e.contains("http://")),
+        }
+    }
+
+    #[test]
+    fn http_sink_new_parses_host_and_port() {
+        let sink = HttpSink::new(SessionId(0), "http://example.com/events", None).unwrap();
+        assert_eq!(sink.endpoint(), "http://example.com:80/events");
+
+        let sink = HttpSink::new(SessionId(0), "http://localhost:9000/x", None).unwrap();
+        assert_eq!(sink.endpoint(), "http://localhost:9000/x");
+
+        let sink = HttpSink::new(SessionId(0), "http://127.0.0.1:3000", None).unwrap();
+        assert_eq!(sink.endpoint(), "http://127.0.0.1:3000/");
+    }
+
+    #[test]
+    fn http_sink_records_to_mock_server() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        // Spin up a minimal one-shot HTTP server in a background thread.
+        // Binds to :0 for an ephemeral port so parallel tests don't clash.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = tx.send(request);
+        });
+
+        let url = format!("http://127.0.0.1:{}/events", addr.port());
+        let mut sink = HttpSink::new(SessionId(42), &url, Some("secret-token".into())).unwrap();
+        sink.record(SessionEvent::UserInput {
+            timestamp_ms: 1_700_000_000_000,
+            turn_index: 0,
+            text: "hello-from-test".into(),
+        });
+
+        server.join().expect("server thread");
+        let request = rx.recv().expect("server received a request");
+
+        assert!(request.starts_with("POST /events HTTP/1.1"));
+        assert!(request.contains("Content-Type: application/json"));
+        assert!(request.contains("Authorization: Bearer secret-token"));
+        assert!(request.contains("hello-from-test"));
+        assert!(request.contains("UserInput"));
+        assert_eq!(sink.failed_writes(), 0);
+    }
+
+    #[test]
+    fn http_sink_failed_post_bumps_counter() {
+        // Port 1 on localhost is reserved and (almost) always unreachable
+        // or refused — the OS treats it as a fine host:port pair but no
+        // process listens there. A connection attempt returns an error
+        // synchronously, which is exactly what we want to exercise.
+        let mut sink = HttpSink::new(SessionId(0), "http://127.0.0.1:1/events", None).unwrap();
+        sink.record(SessionEvent::UserInput {
+            timestamp_ms: 0,
+            turn_index: 0,
+            text: "will fail".into(),
+        });
+        assert!(sink.failed_writes() >= 1);
     }
 
     #[test]
