@@ -1,6 +1,6 @@
 ---
 id: 0021-system-prompt-improvements
-status: draft
+status: done
 ---
 
 # System prompt improvements
@@ -74,4 +74,10 @@ Standing directive: skip checkpoints, execute to completion.
 
 ## Notes
 
-Empty at draft time.
+- Added three categories of guidance: "verify your work" (doing_tasks),
+  "check stderr on shell failure" (actions), and "find before read"
+  (tool_usage). Integrated into existing prose flow, not appended as
+  a separate checklist.
+
+- Kept additions brief — about 12 lines total across three sections.
+  Prompt length increased by ~200 tokens, well within cache thresholds.
